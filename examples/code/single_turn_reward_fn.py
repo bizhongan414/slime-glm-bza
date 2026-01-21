@@ -77,7 +77,7 @@ class RewardFn:
                     pass_rate = float(match_test_pass_rate.group(1)) if match_test_pass_rate else 1.0
                     logger.info(f"{pass_rate=}")
                     if pass_rate == 1.0:
-                        # score = 1
+                        score = 1
                         answer_reward = 1
                         reward_msg = "accept"
                     else:
