@@ -1,0 +1,9 @@
+v0:
+  timeout: |
+    Code execution timeout. please reflect your answer and answer again to slove the problem.
+  wrong_answer: |
+    Code test failed. Please reflect your answer and answer again to slove the problem.
+  no_code: |
+    No code found in the answer. Please reflect your answer and answer again to slove the problem.
+  default: |
+    Try again!
