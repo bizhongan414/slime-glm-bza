@@ -12,6 +12,10 @@ code_rollout_max_turn: 4
 code_feedback_message_filepath: examples/code/deps/multi_turn_feedback.yaml # 默认 examples/code/deps/multi_turn_feedback.yaml
 code_feedback_message_version: v0
 
+# reward
+code_use_format_reward: False
+code_use_timeout_reward: False
+
 # override
 reward_key: reward_value
 eval_reward_key: score
