@@ -5,21 +5,10 @@ import json
 import time
 from types import SimpleNamespace
 
-from examples.code.sandbox_utils import execute_code
+from .sandbox_utils import execute_code
+from .code_metric import CodeExtraInfo
 
-# logger = logging.getLogger(__name__)
-from loguru import logger
-logger.remove()
-logger.add(
-    sink=lambda msg: print(msg, end=""), 
-    colorize=True, 
-    format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-           "<level>{level: <8}</level> | "
-           "<cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - "
-           "<level>{message}</level>",
-    level="INFO"
-)
-logging.getLogger().setLevel(logging.INFO)
+logger = logging.getLogger(__name__)
 
 _TIMEOUT = 60
 
@@ -29,16 +18,21 @@ class RewardFn:
         self.default_memory_limit_mb = args.sandbox_default_memory_limit_mb
         self.local_run = args.sandbox_local_run
 
+        self.sandbox_fusion_url = args.sandbox_url if not self.local_run else None
         self.use_case_custom_time_limit = args.sandbox_use_case_custom_time_limit
         self.use_case_custom_memory_limit = args.sandbox_use_case_custom_memory_limit
         
         self.max_turns = args.code_rollout_max_turn
-        # print(f"[taro_debug] reward fn config:", self.__dict__)
-        
+        self.use_format_reward = args.code_use_format_reward
+        self.use_timeout_reward = args.code_use_timeout_reward
 
     async def __call__(self, sample, **kwargs):
-        code_execute_status = {}
         start_time = time.monotonic()
+        # TODO for debug, save all, future only keep necessary keys
+        extra_info = CodeExtraInfo()
+        meta_data = None
+        pass_rate = None
+        score = 0
         try:
             answer_reward = 0.0
             format_reward = 0.0
@@ -46,17 +40,19 @@ class RewardFn:
 
             extracted_code = _extract_code_from_answer(sample.response)
             if extracted_code is not None:
-                code_execute_status["no_code_extract"] = 0
+                extra_info.no_code_extract = False
+                extra_info.extracted_code = extracted_code
                 
-                ground_truth = json.loads(sample.metadata['reward_model']['ground_truth'])
+                reward_model = sample.metadata['reward_model']
+                ground_truth = json.loads(reward_model['ground_truth'])
                 
-                time_limit = self.use_case_custom_time_limit and ground_truth.get("time_limit", None) or self.default_time_limit_s
-                memory_limit_mb = self.use_case_custom_memory_limit and ground_truth.get("memory_limit_mb", None) or self.default_memory_limit_mb
+                time_limit = self.use_case_custom_time_limit and reward_model.get("time_limit", None) or self.default_time_limit_s
+                memory_limit_mb = self.use_case_custom_memory_limit and reward_model.get("memory_limit_mb", None) or self.default_memory_limit_mb
                 if self.local_run:
                     time_limit += 5
 
                 response, exec_statu, meta_data = execute_code(
-                    sandbox_fusion_url=None,
+                    sandbox_fusion_url=self.sandbox_fusion_url,
                     memory_limit_mb=memory_limit_mb,
                     ground_truth=ground_truth,
                     code=extracted_code,
@@ -64,14 +60,14 @@ class RewardFn:
                     language="python",
                     local_run=self.local_run
                 )
-                
-                # logger.info(f"[taro_debug] meta_data: {repr(meta_data)}")
+                extra_info.meta_data = meta_data
+
                 duration_lst = meta_data.get("duration", None)
                 if duration_lst is not None:
                     if not isinstance(duration_lst, list):
                         duration_lst = [duration_lst]
-                    code_execute_status["code_execute_time"] = sum(duration_lst) / len(duration_lst)
-                    code_execute_status["code_execute_time_max"] = max(duration_lst)
+                    extra_info.code_execute_time = sum(duration_lst) / len(duration_lst)
+                    extra_info.code_execute_time_max = max(duration_lst)
                     
                 if exec_statu.lower() == "timeout":
                     logger.warning("execute code timeout, not implement")
@@ -80,28 +76,37 @@ class RewardFn:
                     match_test_pass_rate = re.search(r"pass rate: \*\*(.*?)\*\*", meta_data["stdout"])
                     pass_rate = float(match_test_pass_rate.group(1)) if match_test_pass_rate else 1.0
                     logger.info(f"{pass_rate=}")
-                    answer_reward = 1
-                    reward_msg = "success"
+                    if pass_rate == 1.0:
+                        # score = 1
+                        answer_reward = 1
+                        reward_msg = "accept"
+                    else:
+                        answer_reward = 0
+                        reward_msg = "wrong_answer"
             else:
                 reward_msg = "no_code"
-                code_execute_status["no_code_extract"] = 1
+                extra_info.no_code_extract = True
             # reward = answer_reward + format_reward + timeout_reward
             reward = answer_reward
-            code_execute_status["code_reward_time"] = round(time.monotonic() - start_time, 4)
+            
+            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
+            extra_info.pass_rate = pass_rate
+            
             return dict(
                 reward_value=reward,
+                score=score,
                 reward_cat=reward_msg,
-                code_execute_status=code_execute_status,
-                extracted_code=extracted_code
+                extra_info=extra_info,
             )
         except Exception as e:
             logger.warning(f"Error in RewardFn: {e=} {sample.prompt=} {sample.response=}")
-            code_execute_status['code_reward_error'] = 1
-            code_execute_status["code_reward_time"] = round(time.monotonic() - start_time, 4)
+            extra_info.code_reward_error = True
+            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
             return dict(
                 reward_value=0.0, 
+                score=score,
                 reward_cat="python_error",
-                code_execute_status=code_execute_status,
+                extra_info=extra_info,
                 error_details=str(e)
             )
 

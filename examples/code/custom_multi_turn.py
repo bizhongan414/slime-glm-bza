@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import yaml
 import inspect
 import logging
 from argparse import Namespace
@@ -25,12 +26,11 @@ from slime.utils.types import Sample
 
 from slime.rollout.rm_hub import async_rm, batched_async_rm
 
-from .code_metric_hub import CodeMetricGatherer
+from .code_metric import CodeMetricGatherer
 
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
-
 
 class GenerateState(metaclass=SingletonMeta):
     """
@@ -112,84 +112,140 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
+    
+    max_turns = getattr(args, "code_rollout_max_turn", 1)
+    messages = sample.prompt.copy()
 
-    if state.processor:
-        processor_output = state.processor(text=sample.prompt, **sample.multimodal_inputs)
-        prompt_ids = processor_output["input_ids"][0]
-        sample.multimodal_train_inputs = {
-            k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
-        } or None
-    else:
-        prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
-
-    if len(sample.response) > 0:
-        sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)
-    else:
-        sampling_params["max_new_tokens"] -= len(prompt_ids)
+    current_sampling_params = sampling_params.copy()
+    
+    prompt_ids = state.tokenizer.apply_chat_template(messages, tools=None, tokenize=True, add_generation_prompt=True)
+    prompt_msg = state.tokenizer.apply_chat_template(messages, tools=None, tokenize=False, add_generation_prompt=True)
+    
+    if not sample.tokens:
+        sample.tokens = prompt_ids
+        sample.loss_mask = []
+    
+    current_sampling_params["max_new_tokens"] -= len(sample.tokens)
 
     assert (
-        sampling_params["max_new_tokens"] >= 0
-    ), f"max_new_tokens: {sampling_params['max_new_tokens']} should not be less than 0"
-    if sampling_params["max_new_tokens"] == 0:
+        current_sampling_params["max_new_tokens"] >= 0
+    ), f"max_new_tokens: {current_sampling_params['max_new_tokens']} should not be less than 0"
+
+    if current_sampling_params["max_new_tokens"] == 0:
         sample.status = Sample.Status.TRUNCATED
         return sample
+    
+    sample.train_metadata = {}
 
-    # Prepare payload for sglang server
-    payload = {
-        "sampling_params": sampling_params,
-        "return_logprob": True,
-    }
+    _turn_idx = 0
+    while _turn_idx < max_turns:
+        _turn_idx += 1
 
-    if args.use_rollout_routing_replay:
-        payload["return_routed_experts"] = True
+        payload = {
+            "sampling_params": current_sampling_params,
+            "return_logprob": True,
+        }
+        if args.use_rollout_routing_replay:
+            payload["return_routed_experts"] = True
 
-    if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
-        image_data = sample.multimodal_inputs["images"]
-        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
+        if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
+            image_data = sample.multimodal_inputs["images"]
+            payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
 
-    # Use existing tokens for multi-turn or tokenize the new prompt
-    if len(sample.response) > 0:
         payload["input_ids"] = sample.tokens
-    else:
-        payload["input_ids"] = prompt_ids
-        if not sample.tokens:  # Initialize sample.tokens for the first turn
-            sample.tokens = prompt_ids
+        prev_tokens_len = len(sample.tokens)
 
-    output = await post(url, payload)
+        output = await post(url, payload)
 
-    if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
-        from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
+        if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
+            from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
 
-        sample = await postprocess_sample_with_radix_tree(args, sample, output)
-    else:
-        if "output_token_logprobs" in output["meta_info"]:
-            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            sample = await postprocess_sample_with_radix_tree(args, sample, output)
         else:
-            new_response_tokens, new_response_log_probs = [], []
+            if "output_token_logprobs" in output["meta_info"]:
+                new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            else:
+                new_response_tokens, new_response_log_probs = [], []
 
-        # Update sample with tokens directly - avoiding re-tokenization
-        sample.tokens = sample.tokens + new_response_tokens
-        sample.response_length += len(new_response_tokens)
-        sample.response += output["text"]
+            sample.tokens += new_response_tokens
+            sample.response_length += len(new_response_tokens)
+            sample.response += output["text"]
+            if "response_lst" not in sample.train_metadata:
+                sample.train_metadata["response_lst"] = []
+            sample.train_metadata["response_lst"].append((_turn_idx, output["text"]))
+            sample.loss_mask += [1] * len(new_response_tokens)
 
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
+            if sample.rollout_log_probs is None:
+                sample.rollout_log_probs = []
+            sample.rollout_log_probs += new_response_log_probs
 
-    if "routed_experts" in output["meta_info"]:
-        sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
-            dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
-        )
+        if "routed_experts" in output["meta_info"]:
+            sample.rollout_routed_experts = np.frombuffer(
+                pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
+                dtype=np.int32,
+            ).reshape(
+                len(sample.tokens) - 1,
+                args.num_layers,
+                args.moe_router_topk,
+            )
 
-    sample.update_from_meta_info(args, output["meta_info"])
+        sample.update_from_meta_info(args, output["meta_info"])
 
+        generated_tokens_len = len(sample.tokens) - prev_tokens_len
+
+        reward = await async_rm(args, sample)
+        sample.reward = reward
+        if "reward_lst" not in sample.train_metadata:
+            sample.train_metadata["reward_lst"] = []
+        sample.train_metadata["reward_lst"].append(reward)
+        
+        reward_value = reward['reward_value']
+        reward_cat = reward['reward_cat']
+        
+        if _turn_idx == max_turns:
+            break
+
+        if reward_cat is not None and reward_cat == "python_error":
+            # TODO 应该抛弃case
+            break
+        
+        if reward_value is not None and reward_value >= 1:
+            break
+        
+        tool_messages = [{
+            "role": "tool",
+            "content": get_feedback_msg(args, reward_cat)
+        }]
+        tool_prompt_msg = state.tokenizer.apply_chat_template(tool_messages, tools=None, tokenize=False, add_generation_prompt=True)
+        tool_prompt_ids = state.tokenizer.apply_chat_template(tool_messages, tools=None, tokenize=True, add_generation_prompt=True)
+
+        # TODO 需要区分 turn 截断 和 原来的 truncated
+        if generated_tokens_len + len(tool_prompt_ids) >= current_sampling_params["max_new_tokens"]:
+            sample.status = Sample.Status.TRUNCATED
+            break
+        sample.tokens += tool_prompt_ids
+        sample.response += tool_prompt_msg
+        sample.response_length += len(tool_prompt_ids)
+        sample.loss_mask += [0] * len(tool_prompt_ids)
+        sample.rollout_log_probs += [0.0] * len(tool_prompt_ids)
+        current_sampling_params["max_new_tokens"] -= generated_tokens_len + len(tool_prompt_ids)
+        
+        if sample.status == Sample.Status.COMPLETED:
+            sample.status = Sample.Status.PENDING
+
+        if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
+            break
+    sample.train_metadata["_turn_idx"] = _turn_idx
     return sample
+
+def get_feedback_msg(args, reward_cat):
+    feedback_message_filepath = args.code_feedback_message_filepath
+    version = args.code_feedback_message_version
+    feedback_info = yaml.safe_load(open(feedback_message_filepath))[version]
+    if reward_cat not in feedback_info:
+        reward_cat = "default"
+    return feedback_info[reward_cat]
 
 
 async def generate_and_rm(
@@ -217,16 +273,9 @@ async def generate_and_rm(
             sample.status = Sample.Status.ABORTED
             return sample
 
+        # TODO Taro custom rollout, directly call generate func for code instead of custom generate
         with state.dp_rank_context() as _:
-            if args.custom_generate_function_path is not None:
-                custom_generate_func = load_function(args.custom_generate_function_path)
-                # if signature has evaluation, pass evaluation
-                if "evaluation" in inspect.signature(custom_generate_func).parameters:
-                    sample = await custom_generate_func(args, sample, sampling_params, evaluation=evaluation)
-                else:
-                    sample = await custom_generate_func(args, sample, sampling_params)
-            else:
-                sample = await generate(args, sample, sampling_params)
+            sample = await generate(args, sample, sampling_params)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
@@ -248,8 +297,9 @@ async def generate_and_rm(
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
-        if sample.reward is None:
-            sample.reward = await async_rm(args, sample)
+        assert sample.reward is not None, "code reward should be assigned in generate_fn"
+        # if sample.reward is None:
+        #     sample.reward = await async_rm(args, sample)
 
     return sample
 
@@ -339,7 +389,6 @@ async def generate_rollout_async(
             - aborted_samples: any partial groups collected during abort when partial_rollout is enabled
     """
     assert args.rollout_global_dataset
-
     state = GenerateState(args)
 
     # instantiate data filters
@@ -361,7 +410,6 @@ async def generate_rollout_async(
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
-            # print(f"[taro_debug] samples: {samples}")
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -370,6 +418,7 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
+                # logger.info(f"First rollout sample: {sample=}")
                 logger.info(
                     f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
                 )
@@ -386,8 +435,9 @@ async def generate_rollout_async(
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
             if len(data) < target_data_size:
-                code_execute_status_lst = [sample.reward['code_execute_status'] for sample in group]
-                metric_gatherer.log_code_execute_status(code_execute_status_lst)
+                # code_execute_status_lst = [sample.reward['code_execute_status'] for sample in group]
+                # metric_gatherer.log_code_execute_status(code_execute_status_lst)
+                metric_gatherer.log_code_sample_train_metadata(group)
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 

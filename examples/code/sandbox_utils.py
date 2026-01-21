@@ -20,8 +20,7 @@ API_TIMEOUT = 10
 
 PY_IMPORTS = yaml.safe_load(open("examples/code/deps/header.yaml"))['python']
 
-# logger = logging.getLogger(__name__)
-from loguru import logger
+logger = logging.getLogger(__name__)
 
 # Define supported languages list (optional, for documentation or validation)
 SUPPORTED_LANGUAGES = [
@@ -219,7 +218,6 @@ def call_sandbox_api(
     """
     request_id = str(uuid.uuid4())  # <-- Generate request_id internally
     log_prefix = f"[Request ID: {request_id}] "  # <-- Create log prefix
-
     if language not in SUPPORTED_LANGUAGES:
         error_msg = f"{log_prefix}Unsupported language: {language}"
         logger.error(error_msg)
@@ -290,7 +288,7 @@ def call_sandbox_api(
         except Exception as e:
             last_error = f"{log_prefix}Unexpected Error: {e}"  # <-- Use internal log_prefix
             break  # Exit retry loop on other unexpected errors
-
+        
     # If loop finishes without returning success, return the last recorded error
     logger.error(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")  # <-- Use internal log_prefix
     # Return the error message without the prefix, as the caller doesn't need the internal ID
@@ -319,7 +317,6 @@ def _process_single_case(
     current_generation_code = generation
 
     if fn_name and language == "python":
-        logger.info(f"[taro_debug] _process_single_case {fn_name=}")
         # Wrapper assumes stdin_data is a JSON string for function arguments.
         current_generation_code = yaml.safe_load(open("examples/code/deps/wrapper.yaml"))['python']
     stdin = None if stdin_data is None else str(stdin_data)
@@ -520,7 +517,7 @@ def check_correctness(
         metadata_list: A list containing metadata dictionaries for each test case,
                        ordered corresponding to the inputs.
     """
-    logger.info("Starting correctness check for generation.")
+    logger.info(f"Starting correctness check for generation, {local_run=}")
 
     if not in_outs or "inputs" not in in_outs or "outputs" not in in_outs:
         logger.warning("Invalid in_outs format provided.")
@@ -548,7 +545,7 @@ def check_correctness(
     # TODO
     #local run -- cpu_bound    Remote run -- io_bound
     max_workers = min(os.cpu_count() // 2 , len(inputs)) if local_run else max(32, os.cpu_count() * 5)
-    print(f"[taro_debug] check_correctness {max_workers=}")
+    
     # max_workers is limited by sandbox_fusion_max_concurrent from concurrent_semaphore
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all tasks, passing the concurrent_semaphore to _process_single_case
