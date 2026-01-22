@@ -31,8 +31,8 @@ class RewardFn:
         # TODO for debug, save all, future only keep necessary keys
         extra_info = CodeExtraInfo()
         meta_data = None
-        pass_rate = None
-        score = 0
+        pass_rate = 0.
+        score = 0.
         try:
             answer_reward = 0.0
             format_reward = 0.0
