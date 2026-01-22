@@ -23,6 +23,7 @@ from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
 from slime.utils.types import Sample
+from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 
 from slime.rollout.rm_hub import async_rm, batched_async_rm
 
@@ -418,10 +419,10 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
-                # logger.info(f"First rollout sample: {sample=}")
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
-                )
+                logger.info(f"First rollout sample: {sample=}")
+                # logger.info(
+                #     f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {sample.label}, reward: {sample.reward}",
+                # )
                 do_print = False
 
             assert len(group) == args.n_samples_per_prompt
@@ -481,8 +482,12 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     results = {}
     for r in results_list:
         results.update(r)
-    return RolloutFnEvalOutput(data=results), []
-
+    metrics = {}
+    for key in results.keys():
+        metric_gatherer = CodeMetricGatherer()
+        metric_gatherer.log_code_sample_train_metadata(results[key]["samples"])
+        metrics |= dict_add_prefix(metric_gatherer.collect(add_prefix=False), f"eval/{key}/")
+    return RolloutFnEvalOutput(data=results, metrics=metrics), []
 
 async def eval_rollout_single_dataset(
     args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
