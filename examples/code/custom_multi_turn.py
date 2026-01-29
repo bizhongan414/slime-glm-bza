@@ -109,6 +109,92 @@ from abc import ABC, abstractmethod
 from typing import Optional, Any
 from uuid import uuid4
 from .tools import tool_registry, PythonSandbox
+from .tool_parser import ToolParser, FunctionCall, extract_code_blocks_sync
+
+
+class AgentData:
+    """
+    Encapsulates all state variables for the agent loop.
+    
+    AgentData is passed through state handlers and can be accessed by tools.
+    This design follows verl's pattern for cleaner state management.
+    
+    Attributes:
+        messages: Conversation history as list of message dicts
+        sample: The Sample object being processed
+        request_id: Unique identifier for this rollout request
+        interaction: Optional interaction handler for multi-turn environments
+        
+        prompt_ids: Token ids for the initial prompt (fixed after PENDING state)
+        response_ids: Token ids for all responses (LLM + observations)
+        response_mask: Mask for response tokens (1=LLM generated, 0=observation/tool)
+        response_logprobs: Log probabilities for response tokens
+        
+        turn_idx: Current turn index
+        user_turns: Number of user/observation turns
+        assistant_turns: Number of assistant response turns
+        
+        current_tool_calls: List of parsed tool calls from current response
+        extra_fields: Dictionary for dynamic additions (e.g., tool session data)
+    """
+    
+    def __init__(
+        self,
+        messages: list[dict[str, Any]],
+        sample: 'Sample',
+        request_id: str,
+        interaction: Optional['BaseInteraction'] = None,
+    ):
+        self.messages = messages
+        self.sample = sample
+        self.request_id = request_id
+        self.interaction = interaction
+        
+        # Token tracking state - explicitly separated
+        self.prompt_ids: list[int] = []
+        self.response_ids: list[int] = []
+        self.response_mask: list[int] = []  # 1 for LLM tokens, 0 for observation tokens
+        self.response_logprobs: list[float] = []
+        
+        # Turn counters
+        self.turn_idx: int = 0
+        self.user_turns: int = 0
+        self.assistant_turns: int = 0
+        
+        # Tool call state
+        self.current_tool_calls: list[FunctionCall] = []
+        
+        # Metrics and extra fields
+        self.metrics: dict[str, Any] = {}
+        self.extra_fields: dict[str, Any] = {}
+    
+    @property
+    def total_turns(self) -> int:
+        """Total number of conversation turns"""
+        return self.user_turns + self.assistant_turns
+    
+    @property
+    def total_response_length(self) -> int:
+        """Total length of response tokens"""
+        return len(self.response_ids)
+    
+    @property
+    def effective_response_length(self) -> int:
+        """Number of LLM-generated tokens (where mask=1)"""
+        return sum(self.response_mask)
+    
+    def get_full_token_sequence(self) -> list[int]:
+        """Get the complete token sequence (prompt + response)"""
+        return self.prompt_ids + self.response_ids
+    
+    def get_full_loss_mask(self) -> list[int]:
+        """Get the complete loss mask (0 for prompt, response_mask for response)"""
+        return [0] * len(self.prompt_ids) + self.response_mask
+    
+    def get_full_log_probs(self) -> list[float]:
+        """Get the complete log probs (0 for prompt, response_logprobs for response)"""
+        return [0.0] * len(self.prompt_ids) + self.response_logprobs
+
 
 class AgentState(Enum):
     PENDING = "pending"
@@ -230,235 +316,288 @@ class AgentLoop:
     """
     Manages the lifecycle of a single sample's rollout:
     Generate -> Tool Execution -> Observation -> Generate ...
+    
+    Refactored to use AgentData for state management and verl-style
+    state handlers that return the next AgentState.
     """
     def __init__(self, 
                  args: Namespace, 
                  sample: Sample, 
                  sampling_params: dict[str, Any], 
                  state_manager: 'GenerateState',
-                 interaction: Optional[BaseInteraction] = None):
+                 interaction: Optional[BaseInteraction] = None,
+                 tool_parser_name: str = "python_code"):
 
         self.args = args
         self.sample = sample
         self.sampling_params = sampling_params
         self.state_manager = state_manager
-        
-        self.current_state = AgentState.PENDING
-        # Use a copy of prompts to maintain history locally for this loop (assuming list format) 
-        self.messages = list(sample.prompt) 
-        self.turn_idx = 0
-        self.max_turns = getattr(args, "code_rollout_max_turn", 5)
         self.interaction = interaction
+        
+        self.max_turns = getattr(args, "code_rollout_max_turn", 5)
+        self.max_response_length = getattr(args, "rollout_max_response_len", 4096)
         
         # Extract execution config
         self.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         
-        self.latest_code_block = None
+        # Initialize tool parser
+        self.tool_parser = ToolParser.get_parser(tool_parser_name, state_manager.tokenizer)
 
     async def run(self) -> Sample:
-        while self.current_state != AgentState.TERMINATED:
-            if self.current_state == AgentState.PENDING:
-                await self._handle_pending()
-            elif self.current_state == AgentState.GENERATING:
-                await self._handle_generating()
-            elif self.current_state == AgentState.PROCESSING_TOOLS:
-                await self._handle_processing_tools()
-            elif self.current_state == AgentState.INTERACTING:
-                await self._handle_interacting()
+        """
+        Main entry point for the agent loop.
+        
+        Uses AgentData to encapsulate all state and runs the state machine
+        until termination.
+        """
+        # Initialize AgentData with state from sample
+        agent_data = AgentData(
+            messages=list(self.sample.prompt),
+            sample=self.sample,
+            request_id=str(uuid4()),
+            interaction=self.interaction,
+        )
+        
+        # State machine loop
+        state = AgentState.PENDING
+        while state != AgentState.TERMINATED:
+            if state == AgentState.PENDING:
+                state = await self._handle_pending_state(agent_data)
+            elif state == AgentState.GENERATING:
+                state = await self._handle_generating_state(agent_data)
+            elif state == AgentState.PROCESSING_TOOLS:
+                state = await self._handle_processing_tools_state(agent_data)
+            elif state == AgentState.INTERACTING:
+                state = await self._handle_interacting_state(agent_data)
+            else:
+                logger.error(f"Invalid state: {state}")
+                state = AgentState.TERMINATED
             
-            # Safety condition
-            if self.turn_idx >= self.max_turns and self.current_state != AgentState.TERMINATED:
+            # Safety condition: check max turns
+            if agent_data.turn_idx >= self.max_turns and state != AgentState.TERMINATED:
                 logger.info(f"Max turns ({self.max_turns}) reached. Terminating.")
-                self.current_state = AgentState.TERMINATED
+                state = AgentState.TERMINATED
+            
+            # Safety condition: check max response length
+            if agent_data.total_response_length >= self.max_response_length and state != AgentState.TERMINATED:
+                logger.info(f"Max response length ({self.max_response_length}) reached. Terminating.")
+                state = AgentState.TERMINATED
         
-        # Update the sample with the full conversation history
-        self.sample.prompt = self.messages
-        self.sample.train_metadata = {"_turn_idx": self.turn_idx}
-        return self.sample
+        # Finalize and return updated sample
+        return self._finalize_sample(agent_data)
 
-    async def _handle_pending(self):
-        """Initialize state, handle any pre-processing"""
-        # Initialize tokens from the initial prompt
-        if not self.sample.tokens:
-            prompt_ids = self.state_manager.tokenizer.apply_chat_template(
-                self.messages, tools=None, tokenize=True, add_generation_prompt=True
-            )
-            self.sample.tokens = prompt_ids
-            # Loss mask for prompt is usually 0 (do not train on prompt)
-            self.sample.loss_mask = [0] * len(prompt_ids)
-            self.sample.rollout_log_probs = [0.0] * len(prompt_ids)
-
-        self.current_state = AgentState.GENERATING
-
-    async def _handle_generating(self):
-        """Generate tokens using SGLang"""
+    async def _handle_pending_state(self, agent_data: AgentData) -> AgentState:
+        """
+        Initialize state and prepare prompt tokens.
         
-        # Apply template
-        # Assume tokenizer works like Hugging Face's apply_chat_template
+        Returns:
+            AgentState.GENERATING to start generation
+        """
+        # Tokenize the initial prompt
         prompt_ids = self.state_manager.tokenizer.apply_chat_template(
-            self.messages, tools=None, tokenize=True, add_generation_prompt=True
+            agent_data.messages, tools=None, tokenize=True, add_generation_prompt=True
+        )
+        agent_data.prompt_ids = prompt_ids
+        
+        return AgentState.GENERATING
+
+    async def _handle_generating_state(self, agent_data: AgentData) -> AgentState:
+        """
+        Generate tokens using SGLang and process the response.
+        
+        Returns:
+            AgentState.PROCESSING_TOOLS if tool calls detected
+            AgentState.INTERACTING if interaction configured
+            AgentState.TERMINATED otherwise
+        """
+        # Apply template to get current prompt ids (including any new turns)
+        current_prompt_ids = self.state_manager.tokenizer.apply_chat_template(
+            agent_data.messages, tools=None, tokenize=True, add_generation_prompt=True
         )
         
         json_data = {
-            "input_ids": prompt_ids,
+            "input_ids": current_prompt_ids,
             "sampling_params": self.sampling_params,
-            # Request logprobs and meta_info for training data collection
             "return_logprob": True,
-            "logprob_start_len": max(0, len(prompt_ids) - 1) 
+            "logprob_start_len": max(0, len(current_prompt_ids) - 1)
         }
 
-        # --- Async Request to SGLang ---
+        # Async Request to SGLang
         try:
             response = await post(self.sglang_url, json_data)
         except Exception as e:
             logger.error(f"Generation failed: {e}")
-            self.current_state = AgentState.TERMINATED
-            return
+            agent_data.sample.status = Sample.Status.FAILED
+            return AgentState.TERMINATED
 
         response_text = response["text"]
         meta_info = response.get("meta_info", {})
         
-        # append assistant response to history
-        self.messages.append({"role": "assistant", "content": response_text})
-        self.sample.response = response_text # Update current response marker
+        # Append assistant response to message history
+        agent_data.messages.append({"role": "assistant", "content": response_text})
+        agent_data.sample.response = response_text
+        agent_data.assistant_turns += 1
 
-        # --- Update Sample Data for Training ---
+        # Extract and track new tokens
         if "output_token_logprobs" in meta_info:
             new_tokens = [item[1] for item in meta_info["output_token_logprobs"]]
             new_logprobs = [item[0] for item in meta_info["output_token_logprobs"]]
-            
-            self.sample.tokens.extend(new_tokens)
-            self.sample.rollout_log_probs.extend(new_logprobs)
-            # Mask: 1 for assistant generated tokens
-            self.sample.loss_mask.extend([1] * len(new_tokens))
-            self.sample.response_length += len(new_tokens)
         else:
-             # Fallback if no logprobs returned
-             new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
-             self.sample.tokens.extend(new_tokens)
-             self.sample.rollout_log_probs.extend([0.0] * len(new_tokens)) # Placeholder
-             self.sample.loss_mask.extend([1] * len(new_tokens))
-             self.sample.response_length += len(new_tokens)
+            # Fallback if no logprobs returned
+            new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+            new_logprobs = [0.0] * len(new_tokens)
+        
+        # Update AgentData with new response tokens (mask=1 for LLM generated)
+        agent_data.response_ids.extend(new_tokens)
+        agent_data.response_mask.extend([1] * len(new_tokens))
+        agent_data.response_logprobs.extend(new_logprobs)
 
         # Handle other metadata
-        self.sample.update_from_meta_info(self.args, meta_info)
+        agent_data.sample.update_from_meta_info(self.args, meta_info)
 
-        # --- Transition Logic ---
-        # Heuristic: Check for python code blocks.
-        code_blocks = self._extract_code_blocks(response_text)
+        # Extract tool calls using the parser
+        _, tool_calls = await self.tool_parser.extract_tool_calls(response_text)
         
-        if code_blocks:
-            self.latest_code_block = code_blocks[-1] # Execute the last block 
-            self.current_state = AgentState.PROCESSING_TOOLS
+        if tool_calls:
+            agent_data.current_tool_calls = tool_calls
+            return AgentState.PROCESSING_TOOLS
+        elif self.interaction:
+            return AgentState.INTERACTING
         else:
-            # No tool call detected, assume conversation end OR turn to user/environment
-            self.current_state = AgentState.INTERACTING
+            return AgentState.TERMINATED
 
-    async def _handle_interacting(self):
-        """Handle interaction with environment/user"""
-        if not self.interaction:
-            # No interaction configured, terminate
-            self.current_state = AgentState.TERMINATED
-            return
-
-        # Generate a request ID (could be per-turn or per-session)
-        request_id = await self.interaction.start_interaction() # Or reuse sample ID if needed
+    async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        """
+        Execute detected tool calls and add observation to conversation.
         
-        should_terminate, response_text, reward, meta = await self.interaction.generate_response(
-            request_id, self.messages, sample=self.sample
-        )
+        Returns:
+            AgentState.GENERATING to continue conversation
+            AgentState.TERMINATED if max turns reached
+        """
+        agent_data.turn_idx += 1
+        agent_data.user_turns += 1
         
-        if response_text:
-            self.messages.append({"role": "user", "content": response_text})
-            # We must update sample tokens with this new user message, marked as unmasked
-            try:
-                if hasattr(self.state_manager.tokenizer, "apply_chat_template"):
-                    formatted_text = self.state_manager.tokenizer.apply_chat_template(
-                         [{"role": "user", "content": response_text}], 
-                         tokenize=False, 
-                         add_generation_prompt=False
-                    )
-                    new_tokens = self.state_manager.tokenizer.encode(formatted_text, add_special_tokens=False)
-                else:
-                    new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
-            except Exception as e:
-                logger.warning(f"Tokenization of interaction output failed: {e}")
-                new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+        logger.debug(f"Executing tool (turn {agent_data.turn_idx})")
+        
+        # Execute the last tool call (typically code_interpreter)
+        if agent_data.current_tool_calls:
+            tool_call = agent_data.current_tool_calls[-1]
+            tool_args = tool_call.get_arguments_dict()
             
-            self.sample.tokens.extend(new_tokens)
-            self.sample.rollout_log_probs.extend([0.0] * len(new_tokens))
-            self.sample.loss_mask.extend([0] * len(new_tokens))
-
-        if reward is not None:
-             # If reward is provided mid-rollout
-             if self.sample.reward is None:
-                 self.sample.reward = reward
-             elif isinstance(self.sample.reward, (int, float)):
-                 self.sample.reward += reward
-
-        if should_terminate:
-            self.current_state = AgentState.TERMINATED
+            result = await tool_registry.execute_tool(tool_call.name, tool_args)
         else:
-            self.current_state = AgentState.GENERATING
-
-    async def _handle_processing_tools(self):
-        """Execute the detected tool/code"""
-        self.turn_idx += 1
+            result = "No tool call to execute"
         
-        logger.debug(f"Executing tool (turn {self.turn_idx})")
-        
-        # Use ToolRegistry to execute
-        # We assume the tool is always 'code_interpreter' for now
-        result = await tool_registry.execute_tool(
-            "code_interpreter", 
-            {"code": self.latest_code_block}
-        )
-        
-        # Format observation
-        # Using 'user' to simulate environment feedback in standard chat models if 'tool' role is not supported
+        # Format observation message
         observation_message = {
-            "role": "user",  
+            "role": "user",
             "content": f"Execution Output:\n{result}"
         }
-        self.messages.append(observation_message)
+        agent_data.messages.append(observation_message)
 
-        # --- Update Sample Data for Training ---
-        # We need to tokenize the new observation to keep sample.tokens aligned with the conversation history.
-        # These tokens are masked (0) in PPO loss.
+        # Tokenize observation and add to response (mask=0 for observation)
+        obs_tokens = self._tokenize_observation(observation_message)
+        agent_data.response_ids.extend(obs_tokens)
+        agent_data.response_mask.extend([0] * len(obs_tokens))
+        agent_data.response_logprobs.extend([0.0] * len(obs_tokens))
+        
+        # Clear current tool calls
+        agent_data.current_tool_calls = []
+        
+        return AgentState.GENERATING
+
+    async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:
+        """
+        Handle interaction with environment/user.
+        
+        Returns:
+            AgentState.GENERATING to continue
+            AgentState.TERMINATED if interaction signals termination
+        """
+        if not agent_data.interaction:
+            return AgentState.TERMINATED
+
+        # Get response from interaction
+        should_terminate, response_text, reward, meta = await agent_data.interaction.generate_response(
+            agent_data.request_id, agent_data.messages, sample=agent_data.sample
+        )
+        agent_data.user_turns += 1
+        
+        if response_text:
+            agent_data.messages.append({"role": "user", "content": response_text})
+            
+            # Tokenize interaction response (mask=0)
+            obs_tokens = self._tokenize_observation({"role": "user", "content": response_text})
+            agent_data.response_ids.extend(obs_tokens)
+            agent_data.response_mask.extend([0] * len(obs_tokens))
+            agent_data.response_logprobs.extend([0.0] * len(obs_tokens))
+
+        # Handle reward
+        if reward is not None:
+            if agent_data.sample.reward is None:
+                agent_data.sample.reward = reward
+            elif isinstance(agent_data.sample.reward, (int, float)):
+                agent_data.sample.reward += reward
+
+        if should_terminate:
+            return AgentState.TERMINATED
+        else:
+            return AgentState.GENERATING
+
+    def _tokenize_observation(self, message: dict[str, Any]) -> list[int]:
+        """
+        Tokenize an observation/user message for adding to response.
+        
+        Args:
+            message: Message dict with 'role' and 'content'
+            
+        Returns:
+            List of token ids
+        """
         try:
-            # Use apply_chat_template to get correct formatting (e.g. <|im_start|>user...)
             if hasattr(self.state_manager.tokenizer, "apply_chat_template"):
-                # Note: This applies template to a single message list. 
-                # Ideally, we'd rely on the tokenizer to handle the specific "user" turn formatting.
                 formatted_text = self.state_manager.tokenizer.apply_chat_template(
-                    [observation_message], 
-                    tokenize=False, 
+                    [message],
+                    tokenize=False,
                     add_generation_prompt=False
                 )
-                # Remove BOS token if added by default, since we are appending
-                # Using add_special_tokens=False in encode roughly handles this if string is clean
-                new_tokens = self.state_manager.tokenizer.encode(formatted_text, add_special_tokens=False)
+                return self.state_manager.tokenizer.encode(formatted_text, add_special_tokens=False)
             else:
-                 new_tokens = self.state_manager.tokenizer.encode(observation_message["content"], add_special_tokens=False)
+                return self.state_manager.tokenizer.encode(message["content"], add_special_tokens=False)
         except Exception as e:
-            logger.warning(f"Tokenization of tool output failed: {e}. Fallback to content encoding.")
-            new_tokens = self.state_manager.tokenizer.encode(observation_message["content"], add_special_tokens=False)
+            logger.warning(f"Tokenization of observation failed: {e}. Fallback to content encoding.")
+            return self.state_manager.tokenizer.encode(message["content"], add_special_tokens=False)
 
-        self.sample.tokens.extend(new_tokens)
-        self.sample.rollout_log_probs.extend([0.0] * len(new_tokens))
-        self.sample.loss_mask.extend([0] * len(new_tokens))
+    def _finalize_sample(self, agent_data: AgentData) -> Sample:
+        """
+        Finalize the sample with data from AgentData.
         
-        # After tool execution, give control back to model to interpret results
-        self.current_state = AgentState.GENERATING
-
-    def _extract_code_blocks(self, text: str) -> list[str]:
-        """Extract content inside ```python ... ``` blocks"""
-        try:
-            # Simple regex search for the last code block
-            matches = re.findall(r"```(?:python\n)?(.*?)```", text, re.DOTALL)
-            return [m.strip() for m in matches]
-        except Exception:
-            return []
+        Args:
+            agent_data: The AgentData containing accumulated state
+            
+        Returns:
+            Updated Sample with tokens, masks, and metadata
+        """
+        sample = agent_data.sample
+        
+        # Set tokens and masks using AgentData helper methods
+        sample.tokens = agent_data.get_full_token_sequence()
+        sample.loss_mask = agent_data.get_full_loss_mask()
+        sample.rollout_log_probs = agent_data.get_full_log_probs()
+        sample.response_length = agent_data.total_response_length
+        
+        # Update conversation history
+        sample.prompt = agent_data.messages
+        
+        # Set training metadata
+        sample.train_metadata = {
+            "_turn_idx": agent_data.turn_idx,
+            "_user_turns": agent_data.user_turns,
+            "_assistant_turns": agent_data.assistant_turns,
+            "_effective_response_length": agent_data.effective_response_length,
+        }
+        
+        return sample
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
