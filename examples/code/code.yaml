@@ -7,6 +7,10 @@ sandbox_use_case_custom_memory_limit: true
 
 sandbox_url: http://10.119.28.31:8080/run_code_with_log
 
+num_workers: 128
+enable_global_rate_limit: true
+rate_limit: 128
+
 # for rollout
 code_rollout_max_turn: 4
 code_feedback_message_filepath: examples/code/deps/multi_turn_feedback.yaml # 默认 examples/code/deps/multi_turn_feedback.yaml

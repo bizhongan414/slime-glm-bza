@@ -5,8 +5,9 @@ import json
 import time
 from types import SimpleNamespace
 
-from .sandbox_utils import execute_code
+from .tools import tool_registry
 from .code_metric import CodeExtraInfo
+from .sandbox_utils import execute_code
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ class RewardFn:
         self.local_run = args.sandbox_local_run
 
         self.sandbox_fusion_url = args.sandbox_url if not self.local_run else None
+        
         self.use_case_custom_time_limit = args.sandbox_use_case_custom_time_limit
         self.use_case_custom_memory_limit = args.sandbox_use_case_custom_memory_limit
         

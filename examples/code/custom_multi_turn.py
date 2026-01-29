@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import yaml
+import json
 import inspect
 import logging
 from argparse import Namespace
@@ -102,143 +103,390 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
+from enum import Enum
+import re
+from abc import ABC, abstractmethod
+from typing import Optional, Any
+from uuid import uuid4
+from .tools import tool_registry, PythonSandbox
+
+class AgentState(Enum):
+    PENDING = "pending"
+    GENERATING = "generating"
+    PROCESSING_TOOLS = "processing_tools" 
+    INTERACTING = "interacting"
+    TERMINATED = "terminated"
+
+class BaseInteraction(ABC):
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
+        self.name: str = config.get("name", "interaction_agent")
+
+    async def start_interaction(self, instance_id: Optional[str] = None, **kwargs) -> str:
+        """Create a session instance."""
+        if instance_id is None:
+            return str(uuid4())
+        else:
+            return instance_id
+
+    async def generate_response(
+        self, instance_id: str, messages: list[dict[str, Any]], **kwargs
+    ) -> tuple[bool, str, float, dict[str, Any]]:
+        """
+        Generates a response for the current turn of interaction.
+        Returns:
+        - should_terminate_sequence (bool)
+        - response_content (str)
+        - current_turn_score (float)
+        - additional_data (dict)
+        """
+        return False, "", 0.0, {}
+
+    async def calculate_score(self) -> float:
+        """
+        Calculates a score for the interaction,
+        potentially considering aspects like partial exposure & in-context task switching.
+        should be invoke at turn-level
+        """
+        return 0.0
+
+    async def finalize_interaction(self) -> None:
+        """
+        Finalizes the interaction session and releases any associated state or resources.
+        Simulates: release state
+        """
+        pass
+
+class CodeInteraction(BaseInteraction):
+    def __init__(self, config: dict[str, Any]):
+        super().__init__(config)
+        self.sandbox = PythonSandbox(
+            timeout=config.get("timeout", 10),
+            memory_limit=config.get("memory_limit", "100MB")
+        )
+        self.use_local_sandbox = config.get("local_run", False)
+        self.sandbox_url = config.get("sandbox_url", None)
+    
+    async def generate_response(
+        self, instance_id: str, messages: list[dict[str, Any]], **kwargs
+    ) -> tuple[bool, str, float, dict[str, Any]]:
+        sample = kwargs.get("sample")
+        
+        # Extract the last assistant message which should contain code
+        last_msg = messages[-1]
+        
+        # Simple extraction logic: check for code block
+        code_blocks = re.findall(r"```(?:python\n)?(.*?)```", last_msg.get("content", ""), re.DOTALL)
+        if not code_blocks:
+            return False, "Please provide python code in a code block.", 0.0, {}
+        
+        code = code_blocks[-1].strip()
+
+        # Get Ground Truth from sample if available
+        ground_truth = {}
+        if sample and sample.metadata:
+            try:
+                reward_model = sample.metadata.get('reward_model', {})
+                if 'ground_truth' in reward_model:
+                     ground_truth = json.loads(reward_model['ground_truth'])
+            except Exception as e:
+                logger.warning(f"Failed to load ground truth: {e}")
+
+        # Execute code using PythonSandbox.execute_code
+        output, status, meta = await self.sandbox.execute_code(
+             sandbox_fusion_url=self.sandbox_url,
+             memory_limit_mb=self.sandbox.memory_limit if isinstance(self.sandbox.memory_limit, int) else 1024,
+             code=code,
+             timeout=self.sandbox.timeout,
+             language="python",
+             ground_truth=ground_truth,
+             local_run=self.use_local_sandbox
+        )
+
+        # Calculate Reward
+        reward = await self.calculate_score(meta)
+            
+        return False, output, reward, meta
+
+    async def calculate_score(self, meta: dict[str, Any]) -> float:
+        """Calculate reward based on execution results"""
+        pass_fail_list = meta.get("pass_fail_list", [])
+        if not pass_fail_list:
+            # If no test cases were run (syntax error or no GT), use status
+            if meta.get("status") == "success":
+                return 1.0
+            elif meta.get("run_status") == "Error" or meta.get("exit_code", 0) != 0:
+                return -1.0 # Significant penalty for runtime error
+            return 0.0
+        
+        # All cases must pass for full reward
+        if all(x == 1 for x in pass_fail_list):
+            return 1.0
+        
+        return 0.0
+
+
+class AgentLoop:
+    """
+    Manages the lifecycle of a single sample's rollout:
+    Generate -> Tool Execution -> Observation -> Generate ...
+    """
+    def __init__(self, 
+                 args: Namespace, 
+                 sample: Sample, 
+                 sampling_params: dict[str, Any], 
+                 state_manager: 'GenerateState',
+                 interaction: Optional[BaseInteraction] = None):
+
+        self.args = args
+        self.sample = sample
+        self.sampling_params = sampling_params
+        self.state_manager = state_manager
+        
+        self.current_state = AgentState.PENDING
+        # Use a copy of prompts to maintain history locally for this loop (assuming list format) 
+        self.messages = list(sample.prompt) 
+        self.turn_idx = 0
+        self.max_turns = getattr(args, "code_rollout_max_turn", 5)
+        self.interaction = interaction
+        
+        # Extract execution config
+        self.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+        
+        self.latest_code_block = None
+
+    async def run(self) -> Sample:
+        while self.current_state != AgentState.TERMINATED:
+            if self.current_state == AgentState.PENDING:
+                await self._handle_pending()
+            elif self.current_state == AgentState.GENERATING:
+                await self._handle_generating()
+            elif self.current_state == AgentState.PROCESSING_TOOLS:
+                await self._handle_processing_tools()
+            elif self.current_state == AgentState.INTERACTING:
+                await self._handle_interacting()
+            
+            # Safety condition
+            if self.turn_idx >= self.max_turns and self.current_state != AgentState.TERMINATED:
+                logger.info(f"Max turns ({self.max_turns}) reached. Terminating.")
+                self.current_state = AgentState.TERMINATED
+        
+        # Update the sample with the full conversation history
+        self.sample.prompt = self.messages
+        self.sample.train_metadata = {"_turn_idx": self.turn_idx}
+        return self.sample
+
+    async def _handle_pending(self):
+        """Initialize state, handle any pre-processing"""
+        # Initialize tokens from the initial prompt
+        if not self.sample.tokens:
+            prompt_ids = self.state_manager.tokenizer.apply_chat_template(
+                self.messages, tools=None, tokenize=True, add_generation_prompt=True
+            )
+            self.sample.tokens = prompt_ids
+            # Loss mask for prompt is usually 0 (do not train on prompt)
+            self.sample.loss_mask = [0] * len(prompt_ids)
+            self.sample.rollout_log_probs = [0.0] * len(prompt_ids)
+
+        self.current_state = AgentState.GENERATING
+
+    async def _handle_generating(self):
+        """Generate tokens using SGLang"""
+        
+        # Apply template
+        # Assume tokenizer works like Hugging Face's apply_chat_template
+        prompt_ids = self.state_manager.tokenizer.apply_chat_template(
+            self.messages, tools=None, tokenize=True, add_generation_prompt=True
+        )
+        
+        json_data = {
+            "input_ids": prompt_ids,
+            "sampling_params": self.sampling_params,
+            # Request logprobs and meta_info for training data collection
+            "return_logprob": True,
+            "logprob_start_len": max(0, len(prompt_ids) - 1) 
+        }
+
+        # --- Async Request to SGLang ---
+        try:
+            response = await post(self.sglang_url, json_data)
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            self.current_state = AgentState.TERMINATED
+            return
+
+        response_text = response["text"]
+        meta_info = response.get("meta_info", {})
+        
+        # append assistant response to history
+        self.messages.append({"role": "assistant", "content": response_text})
+        self.sample.response = response_text # Update current response marker
+
+        # --- Update Sample Data for Training ---
+        if "output_token_logprobs" in meta_info:
+            new_tokens = [item[1] for item in meta_info["output_token_logprobs"]]
+            new_logprobs = [item[0] for item in meta_info["output_token_logprobs"]]
+            
+            self.sample.tokens.extend(new_tokens)
+            self.sample.rollout_log_probs.extend(new_logprobs)
+            # Mask: 1 for assistant generated tokens
+            self.sample.loss_mask.extend([1] * len(new_tokens))
+            self.sample.response_length += len(new_tokens)
+        else:
+             # Fallback if no logprobs returned
+             new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+             self.sample.tokens.extend(new_tokens)
+             self.sample.rollout_log_probs.extend([0.0] * len(new_tokens)) # Placeholder
+             self.sample.loss_mask.extend([1] * len(new_tokens))
+             self.sample.response_length += len(new_tokens)
+
+        # Handle other metadata
+        self.sample.update_from_meta_info(self.args, meta_info)
+
+        # --- Transition Logic ---
+        # Heuristic: Check for python code blocks.
+        code_blocks = self._extract_code_blocks(response_text)
+        
+        if code_blocks:
+            self.latest_code_block = code_blocks[-1] # Execute the last block 
+            self.current_state = AgentState.PROCESSING_TOOLS
+        else:
+            # No tool call detected, assume conversation end OR turn to user/environment
+            self.current_state = AgentState.INTERACTING
+
+    async def _handle_interacting(self):
+        """Handle interaction with environment/user"""
+        if not self.interaction:
+            # No interaction configured, terminate
+            self.current_state = AgentState.TERMINATED
+            return
+
+        # Generate a request ID (could be per-turn or per-session)
+        request_id = await self.interaction.start_interaction() # Or reuse sample ID if needed
+        
+        should_terminate, response_text, reward, meta = await self.interaction.generate_response(
+            request_id, self.messages, sample=self.sample
+        )
+        
+        if response_text:
+            self.messages.append({"role": "user", "content": response_text})
+            # We must update sample tokens with this new user message, marked as unmasked
+            try:
+                if hasattr(self.state_manager.tokenizer, "apply_chat_template"):
+                    formatted_text = self.state_manager.tokenizer.apply_chat_template(
+                         [{"role": "user", "content": response_text}], 
+                         tokenize=False, 
+                         add_generation_prompt=False
+                    )
+                    new_tokens = self.state_manager.tokenizer.encode(formatted_text, add_special_tokens=False)
+                else:
+                    new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+            except Exception as e:
+                logger.warning(f"Tokenization of interaction output failed: {e}")
+                new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+            
+            self.sample.tokens.extend(new_tokens)
+            self.sample.rollout_log_probs.extend([0.0] * len(new_tokens))
+            self.sample.loss_mask.extend([0] * len(new_tokens))
+
+        if reward is not None:
+             # If reward is provided mid-rollout
+             if self.sample.reward is None:
+                 self.sample.reward = reward
+             elif isinstance(self.sample.reward, (int, float)):
+                 self.sample.reward += reward
+
+        if should_terminate:
+            self.current_state = AgentState.TERMINATED
+        else:
+            self.current_state = AgentState.GENERATING
+
+    async def _handle_processing_tools(self):
+        """Execute the detected tool/code"""
+        self.turn_idx += 1
+        
+        logger.debug(f"Executing tool (turn {self.turn_idx})")
+        
+        # Use ToolRegistry to execute
+        # We assume the tool is always 'code_interpreter' for now
+        result = await tool_registry.execute_tool(
+            "code_interpreter", 
+            {"code": self.latest_code_block}
+        )
+        
+        # Format observation
+        # Using 'user' to simulate environment feedback in standard chat models if 'tool' role is not supported
+        observation_message = {
+            "role": "user",  
+            "content": f"Execution Output:\n{result}"
+        }
+        self.messages.append(observation_message)
+
+        # --- Update Sample Data for Training ---
+        # We need to tokenize the new observation to keep sample.tokens aligned with the conversation history.
+        # These tokens are masked (0) in PPO loss.
+        try:
+            # Use apply_chat_template to get correct formatting (e.g. <|im_start|>user...)
+            if hasattr(self.state_manager.tokenizer, "apply_chat_template"):
+                # Note: This applies template to a single message list. 
+                # Ideally, we'd rely on the tokenizer to handle the specific "user" turn formatting.
+                formatted_text = self.state_manager.tokenizer.apply_chat_template(
+                    [observation_message], 
+                    tokenize=False, 
+                    add_generation_prompt=False
+                )
+                # Remove BOS token if added by default, since we are appending
+                # Using add_special_tokens=False in encode roughly handles this if string is clean
+                new_tokens = self.state_manager.tokenizer.encode(formatted_text, add_special_tokens=False)
+            else:
+                 new_tokens = self.state_manager.tokenizer.encode(observation_message["content"], add_special_tokens=False)
+        except Exception as e:
+            logger.warning(f"Tokenization of tool output failed: {e}. Fallback to content encoding.")
+            new_tokens = self.state_manager.tokenizer.encode(observation_message["content"], add_special_tokens=False)
+
+        self.sample.tokens.extend(new_tokens)
+        self.sample.rollout_log_probs.extend([0.0] * len(new_tokens))
+        self.sample.loss_mask.extend([0] * len(new_tokens))
+        
+        # After tool execution, give control back to model to interpret results
+        self.current_state = AgentState.GENERATING
+
+    def _extract_code_blocks(self, text: str) -> list[str]:
+        """Extract content inside ```python ... ``` blocks"""
+        try:
+            # Simple regex search for the last code block
+            matches = re.findall(r"```(?:python\n)?(.*?)```", text, re.DOTALL)
+            return [m.strip() for m in matches]
+        except Exception:
+            return []
+
+
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
-    """Generate using traditional SGLang router with token-based workflow"""
+    """Generate using the Agent Loop State Machine"""
     if args.ci_test:
         assert isinstance(sample.prompt, str)
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
-
+    
     assert (
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
     
-    max_turns = getattr(args, "code_rollout_max_turn", 1)
-    messages = sample.prompt.copy()
+    # Initialize interaction if needed
+    interaction_config = {
+        "sandbox_url": getattr(args, "sandbox_url", None),
+        "local_run": getattr(args, "sandbox_local_run", False),
+        "timeout": getattr(args, "sandbox_default_time_limit_s", 10),
+        "memory_limit": getattr(args, "sandbox_default_memory_limit_mb", 1024)
+    }
+    # For this example, we always use CodeInteraction
+    interaction = CodeInteraction(interaction_config)
 
-    current_sampling_params = sampling_params.copy()
-    
-    prompt_ids = state.tokenizer.apply_chat_template(messages, tools=None, tokenize=True, add_generation_prompt=True)
-    prompt_msg = state.tokenizer.apply_chat_template(messages, tools=None, tokenize=False, add_generation_prompt=True)
-    
-    if not sample.tokens:
-        sample.tokens = prompt_ids
-        sample.loss_mask = []
-    
-    current_sampling_params["max_new_tokens"] -= len(sample.tokens)
+    # Initialize and run the Agent Loop
+    agent_loop = AgentLoop(args, sample, sampling_params, state, interaction=interaction)
+    return await agent_loop.run()
 
-    assert (
-        current_sampling_params["max_new_tokens"] >= 0
-    ), f"max_new_tokens: {current_sampling_params['max_new_tokens']} should not be less than 0"
 
-    if current_sampling_params["max_new_tokens"] == 0:
-        sample.status = Sample.Status.TRUNCATED
-        return sample
-    
-    sample.train_metadata = {}
-
-    _turn_idx = 0
-    while _turn_idx < max_turns:
-        _turn_idx += 1
-
-        payload = {
-            "sampling_params": current_sampling_params,
-            "return_logprob": True,
-        }
-        if args.use_rollout_routing_replay:
-            payload["return_routed_experts"] = True
-
-        if sample.multimodal_inputs and sample.multimodal_inputs["images"]:
-            image_data = sample.multimodal_inputs["images"]
-            payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
-
-        payload["input_ids"] = sample.tokens
-        prev_tokens_len = len(sample.tokens)
-
-        output = await post(url, payload)
-
-        if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
-            from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
-
-            sample = await postprocess_sample_with_radix_tree(args, sample, output)
-        else:
-            if "output_token_logprobs" in output["meta_info"]:
-                new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-                new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-            else:
-                new_response_tokens, new_response_log_probs = [], []
-
-            sample.tokens += new_response_tokens
-            sample.response_length += len(new_response_tokens)
-            sample.response += output["text"]
-            if "response_lst" not in sample.train_metadata:
-                sample.train_metadata["response_lst"] = []
-            sample.train_metadata["response_lst"].append((_turn_idx, output["text"]))
-            sample.loss_mask += [1] * len(new_response_tokens)
-
-            if sample.rollout_log_probs is None:
-                sample.rollout_log_probs = []
-            sample.rollout_log_probs += new_response_log_probs
-
-        if "routed_experts" in output["meta_info"]:
-            sample.rollout_routed_experts = np.frombuffer(
-                pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
-                dtype=np.int32,
-            ).reshape(
-                len(sample.tokens) - 1,
-                args.num_layers,
-                args.moe_router_topk,
-            )
-
-        sample.update_from_meta_info(args, output["meta_info"])
-
-        generated_tokens_len = len(sample.tokens) - prev_tokens_len
-
-        reward = await async_rm(args, sample)
-        sample.reward = reward
-        if "reward_lst" not in sample.train_metadata:
-            sample.train_metadata["reward_lst"] = []
-        sample.train_metadata["reward_lst"].append(reward)
-        
-        reward_value = reward['reward_value']
-        reward_cat = reward['reward_cat']
-        
-        if _turn_idx == max_turns:
-            break
-
-        if reward_cat is not None and reward_cat == "python_error":
-            # TODO 应该抛弃case
-            break
-        
-        if reward_value is not None and reward_value >= 1:
-            break
-        
-        tool_messages = [{
-            "role": "tool",
-            "content": get_feedback_msg(args, reward_cat)
-        }]
-        tool_prompt_msg = state.tokenizer.apply_chat_template(tool_messages, tools=None, tokenize=False, add_generation_prompt=True)
-        tool_prompt_ids = state.tokenizer.apply_chat_template(tool_messages, tools=None, tokenize=True, add_generation_prompt=True)
-
-        # TODO 需要区分 turn 截断 和 原来的 truncated
-        if generated_tokens_len + len(tool_prompt_ids) >= current_sampling_params["max_new_tokens"]:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        sample.tokens += tool_prompt_ids
-        sample.response += tool_prompt_msg
-        sample.response_length += len(tool_prompt_ids)
-        sample.loss_mask += [0] * len(tool_prompt_ids)
-        sample.rollout_log_probs += [0.0] * len(tool_prompt_ids)
-        current_sampling_params["max_new_tokens"] -= generated_tokens_len + len(tool_prompt_ids)
-        
-        if sample.status == Sample.Status.COMPLETED:
-            sample.status = Sample.Status.PENDING
-
-        if sample.status in (Sample.Status.COMPLETED, Sample.Status.TRUNCATED):
-            break
-    sample.train_metadata["_turn_idx"] = _turn_idx
-    return sample
 
 def get_feedback_msg(args, reward_cat):
     feedback_message_filepath = args.code_feedback_message_filepath
@@ -298,9 +546,9 @@ async def generate_and_rm(
         if sample.status == Sample.Status.ABORTED:
             return sample
         # for multi-turn environment, a reward could be assigned to the agent.
-        assert sample.reward is not None, "code reward should be assigned in generate_fn"
-        # if sample.reward is None:
-        #     sample.reward = await async_rm(args, sample)
+        # assert sample.reward is not None, "code reward should be assigned in generate_fn"
+        if sample.reward is None:
+            sample.reward = await async_rm(args, sample)
 
     return sample
 

@@ -8,8 +8,9 @@ import threading
 import time
 import traceback
 import uuid
-from typing import Any, Optional
-
+from typing import Any, Optional, Callable, TypeVar
+from contextlib import ExitStack
+from enum import Enum
 import requests
 import resource
 
@@ -21,7 +22,7 @@ API_TIMEOUT = 10
 PY_IMPORTS = yaml.safe_load(open("examples/code/deps/header.yaml"))['python']
 
 logger = logging.getLogger(__name__)
-
+T = TypeVar("T")
 # Define supported languages list (optional, for documentation or validation)
 SUPPORTED_LANGUAGES = [
     "python",
@@ -55,6 +56,68 @@ SUPPORTED_LANGUAGES = [
     "racket",
 ]
 
+
+class PoolMode(Enum):
+    ThreadMode = 1
+    ProcessMode = 2
+
+
+@ray.remote(concurrency_groups={"acquire": 1, "release": 10})
+class TokenBucketWorker:
+    def __init__(self, rate_limit: int):
+        self.rate_limit = rate_limit
+        # this only used for observalability
+        self.current_count = 0
+        self._semaphore = threading.Semaphore(rate_limit)
+
+    @ray.method(concurrency_group="acquire")
+    def acquire(self):
+        self._semaphore.acquire()
+        self.current_count += 1
+
+    @ray.method(concurrency_group="release")
+    def release(self):
+        self._semaphore.release()
+        self.current_count -= 1
+
+    def get_current_count(self):
+        return self.current_count
+
+
+class ExecutionWorker:
+    def __init__(self, enable_global_rate_limit=True, rate_limit=10):
+        self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
+
+    def _init_rate_limit(self, rate_limit):
+        return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+
+    def ping(self):
+        return True
+
+    def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
+        with ExitStack() as stack:
+            stack.callback(self.rate_limit_worker.release.remote)
+            ray.get(self.rate_limit_worker.acquire.remote())
+            try:
+                return fn(*fn_args, **fn_kwargs)
+            except Exception as e:
+                # TODO we should make this available to the tool caller
+                logger.warning(f"Error when executing code: {e}")
+
+
+def init_execution_pool(
+    num_workers: int, enable_global_rate_limit=True, rate_limit=10, mode: PoolMode = PoolMode.ThreadMode
+):
+    if mode == PoolMode.ThreadMode:
+        return (
+            ray.remote(ExecutionWorker)
+            .options(max_concurrency=num_workers)
+            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
+        )
+    else:
+        raise NotImplementedError("Process mode is not implemented yet")
+    
+    
 def _set_memory_limit(mb_limit: int):
     if mb_limit > 0:
         limit_in_bytes = mb_limit * 4 * 1024 * 1024
