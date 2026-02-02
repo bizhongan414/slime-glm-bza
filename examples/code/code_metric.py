@@ -12,7 +12,7 @@ class CodeExtraInfo:
     code_reward_time: float | None = None
     code_execute_time: float | None = None
     code_execute_time_max: float | None = None
-
+    pass_fail_list: list | None = None
     extracted_code: str | None = None
     pass_rate: float = 0.
     meta_data: dict | None = None

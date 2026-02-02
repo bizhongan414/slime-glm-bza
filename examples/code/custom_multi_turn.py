@@ -34,6 +34,133 @@ __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
 
+
+# Default system prompt for code assistant
+DEFAULT_CODE_SYSTEM_PROMPT = (
+    "You are a helpful assistant that can use Python to solve problems. "
+    "When you need to perform calculations or execute code, wrap your code "
+    "in ```python``` code blocks. The code will be executed and the output "
+    "will be provided to you."
+)
+
+
+def initialize_system_prompt(tokenizer) -> list[int]:
+    """
+    Pre-calculate system prompt tokens for efficient incremental tokenization.
+    
+    This follows verl's approach: by computing the token difference between
+    a single message and two identical messages, we can extract the "prefix"
+    that the chat template adds (system prompt, special tokens, etc.).
+    
+    When tokenizing new messages incrementally, we can slice off these prefix
+    tokens to get only the new message tokens, enabling concatenation.
+    
+    Args:
+        tokenizer: HuggingFace tokenizer with apply_chat_template support
+        
+    Returns:
+        List of token IDs representing the system/prefix portion of the template
+    """
+    try:
+        token1 = tokenizer.apply_chat_template(
+            [{"role": "user", "content": ""}], 
+            add_generation_prompt=False, 
+            tokenize=True
+        )
+        token2 = tokenizer.apply_chat_template(
+            [{"role": "user", "content": ""}] * 2, 
+            add_generation_prompt=False, 
+            tokenize=True
+        )
+        # The difference is the per-message overhead; the prefix is everything before
+        per_message_len = len(token2) - len(token1)
+        system_prompt = token1[:len(token1) - per_message_len] if per_message_len > 0 else []
+        return system_prompt
+    except Exception as e:
+        logger.warning(f"Failed to calculate system prompt tokens: {e}. Using empty list.")
+        return []
+
+
+def extract_generation_prompt(tokenizer) -> list[int]:
+    """
+    Extract the generation prompt tokens that appear after the last message.
+    
+    Args:
+        tokenizer: HuggingFace tokenizer with apply_chat_template support
+        
+    Returns:
+        List of token IDs for the generation prompt (e.g., "<|assistant|>")
+    """
+    try:
+        token_no_gen = tokenizer.apply_chat_template(
+            [{"role": "user", "content": ""}], 
+            add_generation_prompt=False, 
+            tokenize=True
+        )
+        token_with_gen = tokenizer.apply_chat_template(
+            [{"role": "user", "content": ""}], 
+            add_generation_prompt=True, 
+            tokenize=True
+        )
+        return token_with_gen[len(token_no_gen):]
+    except Exception as e:
+        logger.warning(f"Failed to extract generation prompt: {e}. Using empty list.")
+        return []
+    
+
+def format_messages_for_agent(
+    prompt: str | list[dict[str, Any]],
+    system_prompt: str = None,
+    previous_messages: list[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """
+    Format prompt into a proper message list for the agent loop.
+    
+    Handles both string prompts and list-of-message prompts.
+    Adds system prompt if provided or uses default.
+    
+    Args:
+        prompt: Either a string prompt or a list of message dicts
+        system_prompt: Optional system prompt. If None, uses default.
+        previous_messages: Optional list of previous messages to append.
+    
+    Returns:
+        List of properly formatted message dicts
+    """
+    messages = []
+    # Add system message
+    if system_prompt is not None:
+        messages.append({"role": "system", "content": system_prompt})
+    
+    # Handle prompt based on type
+    if isinstance(prompt, str):
+        # String prompt -> single user message
+        messages.append({"role": "user", "content": prompt})
+    elif isinstance(prompt, list):
+        # List of messages - check if it already has system prompt
+        has_system = any(
+            isinstance(m, dict) and m.get("role") == "system" 
+            for m in prompt
+        )
+        if has_system or system_prompt is None:
+            # Use as-is if it has system prompt or we don't want to add one
+            messages = list(prompt)
+        else:
+            # Prepend system prompt if needed
+            for m in prompt:
+                if isinstance(m, dict):
+                    messages.append(m)
+    else:
+        # Fallback for unexpected types
+        logger.warning(f"Unexpected prompt type: {type(prompt)}")
+        messages.append({"role": "user", "content": str(prompt)})
+    
+    # Add previous messages if provided
+    if previous_messages:
+        messages.extend(previous_messages)
+    
+    return messages
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -183,6 +310,14 @@ class AgentData:
         """Number of LLM-generated tokens (where mask=1)"""
         return sum(self.response_mask)
     
+    def get_response_loss_mask(self) -> list[int]:
+        """Get the complete loss mask (0 for prompt, response_mask for response)"""
+        return self.response_mask
+    
+    def get_response_log_probs(self) -> list[float]:
+        """Get the complete log probs (0 for prompt, response_logprobs for response)"""
+        return self.response_logprobs
+    
     def get_full_token_sequence(self) -> list[int]:
         """Get the complete token sequence (prompt + response)"""
         return self.prompt_ids + self.response_ids
@@ -204,9 +339,14 @@ class AgentState(Enum):
     TERMINATED = "terminated"
 
 class BaseInteraction(ABC):
+    # Default role for interaction responses (can be 'user' or 'tool')
+    response_role: str = "tool"
+    
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self.name: str = config.get("name", "interaction_agent")
+        # Allow role to be overridden from config
+        self.response_role = config.get("response_role", self.__class__.response_role)
 
     async def start_interaction(self, instance_id: Optional[str] = None, **kwargs) -> str:
         """Create a session instance."""
@@ -217,16 +357,20 @@ class BaseInteraction(ABC):
 
     async def generate_response(
         self, instance_id: str, messages: list[dict[str, Any]], **kwargs
-    ) -> tuple[bool, str, float, dict[str, Any]]:
+    ) -> tuple[bool, str, dict[str, Any], dict[str, Any]]:
         """
         Generates a response for the current turn of interaction.
         Returns:
         - should_terminate_sequence (bool)
         - response_content (str)
-        - current_turn_score (float)
+        - reward_result (dict): Matches RewardFn format with keys:
+            - reward_value (float): The actual reward value
+            - score (int): 0 or 1 for pass/fail
+            - reward_cat (str): Category like 'accept', 'wrong_answer', 'no_code', etc.
+            - extra_info (CodeExtraInfo): Execution metadata
         - additional_data (dict)
         """
-        return False, "", 0.0, {}
+        return False, "", {}, {}
 
     async def calculate_score(self) -> float:
         """
@@ -252,64 +396,134 @@ class CodeInteraction(BaseInteraction):
         )
         self.use_local_sandbox = config.get("local_run", False)
         self.sandbox_url = config.get("sandbox_url", None)
+        self.response_role: str = "tool"
     
     async def generate_response(
         self, instance_id: str, messages: list[dict[str, Any]], **kwargs
     ) -> tuple[bool, str, float, dict[str, Any]]:
-        sample = kwargs.get("sample")
+        import time
+        from .code_metric import CodeExtraInfo
         
+        start_time = time.monotonic()
+        sample = kwargs.get("sample")
+        extra_info = CodeExtraInfo()
         # Extract the last assistant message which should contain code
         last_msg = messages[-1]
         
         # Simple extraction logic: check for code block
         code_blocks = re.findall(r"```(?:python\n)?(.*?)```", last_msg.get("content", ""), re.DOTALL)
         if not code_blocks:
-            return False, "Please provide python code in a code block.", 0.0, {}
+            extra_info.no_code_extract = True
+            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
+            reward_result = dict(
+                reward_value=0.0,
+                score=0,
+                reward_cat="no_code",
+                extra_info=extra_info,
+            )
+            return False, "Please provide python code in a code block.", reward_result, {}
         
         code = code_blocks[-1].strip()
+        extra_info.no_code_extract = False
+        extra_info.extracted_code = code
 
         # Get Ground Truth from sample if available
         ground_truth = {}
+        time_limit = self.sandbox.timeout
+        memory_limit_mb = self.sandbox.memory_limit if isinstance(self.sandbox.memory_limit, int) else 1024
+        
         if sample and sample.metadata:
             try:
                 reward_model = sample.metadata.get('reward_model', {})
                 if 'ground_truth' in reward_model:
                      ground_truth = json.loads(reward_model['ground_truth'])
+                # Use custom time/memory limits if available
+                if reward_model.get("time_limit"):
+                    time_limit = reward_model["time_limit"]
+                if reward_model.get("memory_limit_mb"):
+                    memory_limit_mb = reward_model["memory_limit_mb"]
             except Exception as e:
                 logger.warning(f"Failed to load ground truth: {e}")
 
         # Execute code using PythonSandbox.execute_code
-        output, status, meta = await self.sandbox.execute_code(
-             sandbox_fusion_url=self.sandbox_url,
-             memory_limit_mb=self.sandbox.memory_limit if isinstance(self.sandbox.memory_limit, int) else 1024,
-             code=code,
-             timeout=self.sandbox.timeout,
-             language="python",
-             ground_truth=ground_truth,
-             local_run=self.use_local_sandbox
-        )
-
-        # Calculate Reward
-        reward = await self.calculate_score(meta)
+        try:
+            output, status, meta = await self.sandbox.execute_code(
+                sandbox_fusion_url=self.sandbox_url,
+                memory_limit_mb=memory_limit_mb,
+                code=code,
+                timeout=time_limit,
+                language="python",
+                ground_truth=ground_truth,
+                local_run=self.use_local_sandbox
+            )
+            breakpoint()
+            extra_info.meta_data = meta
             
-        return False, output, reward, meta
+            # Track execution time
+            duration_lst = meta.get("duration", None)
+            if duration_lst is not None:
+                if not isinstance(duration_lst, list):
+                    duration_lst = [duration_lst]
+                extra_info.code_execute_time = sum(duration_lst) / len(duration_lst)
+                extra_info.code_execute_time_max = max(duration_lst)
 
-    async def calculate_score(self, meta: dict[str, Any]) -> float:
-        """Calculate reward based on execution results"""
+            # Calculate Reward using aligned logic
+            reward_result = await self.calculate_score(meta, extra_info, status)
+            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
+
+        except Exception as e:
+            logger.warning(f"Error in CodeInteraction: {e}")
+            extra_info.code_reward_error = True
+            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
+            reward_result = dict(
+                reward_value=0.0,
+                score=0,
+                reward_cat="python_error",
+                extra_info=extra_info,
+                error_details=str(e)
+            )
+            return False, str(e), reward_result, {}
+
+            
+        return reward_result["reward_value"] == 1.0, output, reward_result, meta
+
+    async def calculate_score(self, meta: dict[str, Any], extra_info: "CodeExtraInfo", exec_status: str) -> float:
+        pass_rate = 0.0
+        score = 0
+        answer_reward = 0.0
+        breakpoint()
         pass_fail_list = meta.get("pass_fail_list", [])
-        if not pass_fail_list:
-            # If no test cases were run (syntax error or no GT), use status
-            if meta.get("status") == "success":
-                return 1.0
-            elif meta.get("run_status") == "Error" or meta.get("exit_code", 0) != 0:
-                return -1.0 # Significant penalty for runtime error
-            return 0.0
+        if pass_fail_list:
+            extra_info.pass_fail_list = pass_fail_list
         
-        # All cases must pass for full reward
-        if all(x == 1 for x in pass_fail_list):
-            return 1.0
+        stdout = meta.get("stdout", "")
+        match_test_pass_rate = re.search(r"pass rate: \*\*(.*?)\*\*", stdout)
+        if match_test_pass_rate:
+            pass_rate = float(match_test_pass_rate.group(1))
+        else:
+            pass_fail_list = meta.get("pass_fail_list", [])
+            if pass_fail_list:
+                pass_rate = sum(pass_fail_list) / len(pass_fail_list)
+            elif meta.get("api_status").lower() == "success":
+                pass_rate = 1.0
         
-        return 0.0
+        extra_info.pass_rate = pass_rate
+        
+        if pass_rate == 1.0:
+            score = 1
+            answer_reward = 1.0
+            reward_cat = "accept"
+        elif meta.get("run_status").lower() == "error" or meta.get("exit_code", 0) != 0:
+            reward_cat = "runtime_error"
+        else:
+            reward_cat = "wrong_answer"
+        
+        return dict(
+            reward_value=answer_reward,
+            score=score,
+            reward_cat=reward_cat,
+            extra_info=extra_info,
+        )
 
 
 class AgentLoop:
@@ -326,7 +540,7 @@ class AgentLoop:
                  sampling_params: dict[str, Any], 
                  state_manager: 'GenerateState',
                  interaction: Optional[BaseInteraction] = None,
-                 tool_parser_name: str = "python_code"):
+                 tool_parser_name: str = "hermes"):
 
         self.args = args
         self.sample = sample
@@ -336,12 +550,56 @@ class AgentLoop:
         
         self.max_turns = getattr(args, "code_rollout_max_turn", 5)
         self.max_response_length = getattr(args, "rollout_max_response_len", 4096)
-        
+        self.max_assistant_turns = getattr(args, "code_max_assistant_turns", None)
+        self.max_user_turns = getattr(args, "code_max_user_turns", None)
         # Extract execution config
         self.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         
         # Initialize tool parser
         self.tool_parser = ToolParser.get_parser(tool_parser_name, state_manager.tokenizer)
+
+        # Get apply_chat_template_kwargs from args (supports both CLI --apply-chat-template-kwargs
+        self.apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
+
+        # Cache system prompt tokens for incremental tokenization (verl-style)
+        # This allows us to slice off prefix tokens when tokenizing new messages incrementally
+        self.system_prompt_tokens = initialize_system_prompt(state_manager.tokenizer)
+        self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
+    
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        add_generation_prompt: bool = True,
+        remove_system_prompt: bool = False,
+    ) -> list[int]:
+        """
+        Apply chat template with optional system prompt removal for incremental tokenization.
+        
+        This follows verl's pattern: when tokenizing new messages (tool responses, 
+        user messages) to append to existing prompt_ids, we remove the system prompt
+        prefix so tokens can be cleanly concatenated.
+        
+        Args:
+            messages: List of message dicts to tokenize
+            add_generation_prompt: Whether to add generation prompt at the end
+            remove_system_prompt: If True, slice off system prompt tokens for incremental use
+            
+        Returns:
+            List of token IDs
+        """
+        prompt_ids = self.state_manager.tokenizer.apply_chat_template(
+            messages,
+            tools=None,
+            tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            **self.apply_chat_template_kwargs  # User-configurable extra args
+        )
+        
+        if remove_system_prompt and self.system_prompt_tokens:
+            prompt_ids = prompt_ids[len(self.system_prompt_tokens):]
+        
+        return prompt_ids
+
 
     async def run(self) -> Sample:
         """
@@ -351,8 +609,12 @@ class AgentLoop:
         until termination.
         """
         # Initialize AgentData with state from sample
+        # Use format_messages_for_agent to handle string/list prompts and optionally add system prompt
+        system_prompt = getattr(self.args, "code_system_prompt", None)
+        messages = format_messages_for_agent(self.sample.prompt, system_prompt=system_prompt)
+        
         agent_data = AgentData(
-            messages=list(self.sample.prompt),
+            messages=messages,
             sample=self.sample,
             request_id=str(uuid4()),
             interaction=self.interaction,
@@ -373,15 +635,16 @@ class AgentLoop:
                 logger.error(f"Invalid state: {state}")
                 state = AgentState.TERMINATED
             
-            # Safety condition: check max turns
+
             if agent_data.turn_idx >= self.max_turns and state != AgentState.TERMINATED:
                 logger.info(f"Max turns ({self.max_turns}) reached. Terminating.")
                 state = AgentState.TERMINATED
             
-            # Safety condition: check max response length
+
             if agent_data.total_response_length >= self.max_response_length and state != AgentState.TERMINATED:
                 logger.info(f"Max response length ({self.max_response_length}) reached. Terminating.")
                 state = AgentState.TERMINATED
+                agent_data.sample.status = Sample.Status.TRUNCATED
         
         # Finalize and return updated sample
         return self._finalize_sample(agent_data)
@@ -394,11 +657,9 @@ class AgentLoop:
             AgentState.GENERATING to start generation
         """
         # Tokenize the initial prompt
-        prompt_ids = self.state_manager.tokenizer.apply_chat_template(
-            agent_data.messages, tools=None, tokenize=True, add_generation_prompt=True
-        )
+        prompt_ids =  self.apply_chat_template(
+            agent_data.messages, add_generation_prompt=True)
         agent_data.prompt_ids = prompt_ids
-        
         return AgentState.GENERATING
 
     async def _handle_generating_state(self, agent_data: AgentData) -> AgentState:
@@ -410,12 +671,10 @@ class AgentLoop:
             AgentState.INTERACTING if interaction configured
             AgentState.TERMINATED otherwise
         """
-        # Apply template to get current prompt ids (including any new turns)
-        current_prompt_ids = self.state_manager.tokenizer.apply_chat_template(
-            agent_data.messages, tools=None, tokenize=True, add_generation_prompt=True
-        )
+        # Use accumulated prompt_ids directly (already includes all previous turns + generation prompt)
+        current_prompt_ids = agent_data.prompt_ids
         
-        json_data = {
+        payload = {
             "input_ids": current_prompt_ids,
             "sampling_params": self.sampling_params,
             "return_logprob": True,
@@ -424,12 +683,12 @@ class AgentLoop:
 
         # Async Request to SGLang
         try:
-            response = await post(self.sglang_url, json_data)
+            response = await post(self.sglang_url, payload)
         except Exception as e:
             logger.error(f"Generation failed: {e}")
             agent_data.sample.status = Sample.Status.FAILED
             return AgentState.TERMINATED
-
+        
         response_text = response["text"]
         meta_info = response.get("meta_info", {})
         
@@ -448,16 +707,15 @@ class AgentLoop:
             new_logprobs = [0.0] * len(new_tokens)
         
         # Update AgentData with new response tokens (mask=1 for LLM generated)
+        agent_data.prompt_ids += new_tokens
         agent_data.response_ids.extend(new_tokens)
         agent_data.response_mask.extend([1] * len(new_tokens))
         agent_data.response_logprobs.extend(new_logprobs)
 
-        # Handle other metadata
         agent_data.sample.update_from_meta_info(self.args, meta_info)
 
-        # Extract tool calls using the parser
         _, tool_calls = await self.tool_parser.extract_tool_calls(response_text)
-        
+        breakpoint()
         if tool_calls:
             agent_data.current_tool_calls = tool_calls
             return AgentState.PROCESSING_TOOLS
@@ -488,15 +746,20 @@ class AgentLoop:
         else:
             result = "No tool call to execute"
         
-        # Format observation message
+        # Format observation message (use 'tool' role for tool responses, per OpenAI chat format)
         observation_message = {
-            "role": "user",
+            "role": "tool",
             "content": f"Execution Output:\n{result}"
         }
         agent_data.messages.append(observation_message)
 
-        # Tokenize observation and add to response (mask=0 for observation)
-        obs_tokens = self._tokenize_observation(observation_message)
+        # Incremental tokenization: tokenize only the new message, remove system prefix
+        obs_tokens = self.apply_chat_template([observation_message], add_generation_prompt=True, remove_system_prompt=True)
+        
+        # Update accumulated prompt_ids (for next generation)
+        agent_data.prompt_ids.extend(obs_tokens)
+        
+        # Track observation tokens in response (mask=0 for non-LLM tokens)
         agent_data.response_ids.extend(obs_tokens)
         agent_data.response_mask.extend([0] * len(obs_tokens))
         agent_data.response_logprobs.extend([0.0] * len(obs_tokens))
@@ -518,55 +781,39 @@ class AgentLoop:
             return AgentState.TERMINATED
 
         # Get response from interaction
+
         should_terminate, response_text, reward, meta = await agent_data.interaction.generate_response(
             agent_data.request_id, agent_data.messages, sample=agent_data.sample
         )
+        agent_data.turn_idx += 1
         agent_data.user_turns += 1
-        
+        breakpoint()
         if response_text:
-            agent_data.messages.append({"role": "user", "content": response_text})
+            # Use the interaction's configured response_role (default: 'tool')
+            role = agent_data.interaction.response_role
+            interaction_message = {"role": role, "content": response_text}
+            agent_data.messages.append(interaction_message)
             
-            # Tokenize interaction response (mask=0)
-            obs_tokens = self._tokenize_observation({"role": "user", "content": response_text})
-            agent_data.response_ids.extend(obs_tokens)
-            agent_data.response_mask.extend([0] * len(obs_tokens))
-            agent_data.response_logprobs.extend([0.0] * len(obs_tokens))
+            # Incremental tokenization for interaction response
+            response_tokens = self.apply_chat_template([interaction_message], add_generation_prompt=True, remove_system_prompt=True)
+            
+            # Update accumulated prompt_ids (for next generation)
+            agent_data.prompt_ids.extend(response_tokens)
+            
+            # Track in response (mask=0 for non-LLM tokens)
+            agent_data.response_ids.extend(response_tokens)
+            agent_data.response_mask.extend([0] * len(response_tokens))
+            agent_data.response_logprobs.extend([0.0] * len(response_tokens))
 
         # Handle reward
         if reward is not None:
-            if agent_data.sample.reward is None:
-                agent_data.sample.reward = reward
-            elif isinstance(agent_data.sample.reward, (int, float)):
-                agent_data.sample.reward += reward
-
+            agent_data.sample.reward = reward
+        
         if should_terminate:
             return AgentState.TERMINATED
         else:
             return AgentState.GENERATING
 
-    def _tokenize_observation(self, message: dict[str, Any]) -> list[int]:
-        """
-        Tokenize an observation/user message for adding to response.
-        
-        Args:
-            message: Message dict with 'role' and 'content'
-            
-        Returns:
-            List of token ids
-        """
-        try:
-            if hasattr(self.state_manager.tokenizer, "apply_chat_template"):
-                formatted_text = self.state_manager.tokenizer.apply_chat_template(
-                    [message],
-                    tokenize=False,
-                    add_generation_prompt=False
-                )
-                return self.state_manager.tokenizer.encode(formatted_text, add_special_tokens=False)
-            else:
-                return self.state_manager.tokenizer.encode(message["content"], add_special_tokens=False)
-        except Exception as e:
-            logger.warning(f"Tokenization of observation failed: {e}. Fallback to content encoding.")
-            return self.state_manager.tokenizer.encode(message["content"], add_special_tokens=False)
 
     def _finalize_sample(self, agent_data: AgentData) -> Sample:
         """
@@ -582,8 +829,8 @@ class AgentLoop:
         
         # Set tokens and masks using AgentData helper methods
         sample.tokens = agent_data.get_full_token_sequence()
-        sample.loss_mask = agent_data.get_full_loss_mask()
-        sample.rollout_log_probs = agent_data.get_full_log_probs()
+        sample.loss_mask = agent_data.get_response_loss_mask() #loss mask in slime is only for response part
+        sample.rollout_log_probs = agent_data.get_response_log_probs()
         sample.response_length = agent_data.total_response_length
         
         # Update conversation history

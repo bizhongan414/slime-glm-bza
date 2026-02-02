@@ -306,7 +306,7 @@ class PythonSandbox:
 
             #env["OPENBLAS_NUM_THREADS"] = "1"
             if "PYTHONPATH" in env:
-                del env["PYTHONPATH"] # avoid importing wrong stuff
+                del env["PYTHONPATH"]
 
             # 使用 asyncio.create_subprocess_exec 实现非阻塞子进程调用
             process = await asyncio.create_subprocess_exec(
@@ -316,8 +316,6 @@ class PythonSandbox:
                 stderr=asyncio.subprocess.PIPE,
                 stdin=asyncio.subprocess.PIPE if stdin else None,
                 env=env,
-                # 注意：preexec_fn 在 asyncio 中不直接支持，这里忽略内存限制的 preexec_fn
-                # 如果必须，或者需要使用 setrlimit，需要在外部或者 wrapper 脚本中处理
             )
             try:
                 stdout_data, stderr_data = await asyncio.wait_for(
@@ -352,7 +350,7 @@ class PythonSandbox:
                 await asyncio.to_thread(lambda: __import__('shutil').rmtree(workdir, ignore_errors=True))
                 logger.info(f"{log_prefix}Local sandbox execution completed successfully")
                 return result, None
-            except subprocess.TimeoutExpired:
+            except asyncio.TimeoutError:
                 try:
                     process.kill()
                 except ProcessLookupError:
@@ -377,6 +375,8 @@ class PythonSandbox:
         except Exception as e:
             error_msg = f"{log_prefix}Unexpected error during local sandbox execution: {e}"
             logger.error(error_msg)
+            error_details = traceback.format_exc() # 获取完整的错误堆栈 
+            logger.error(error_details)
             result = {
                 "status": "Failed",
                 "run_status": "Error",
@@ -742,7 +742,7 @@ class PythonSandbox:
         num_cases = len(inputs)
         results = [None] * num_cases  # Initialize with placeholders
         metadata_list = [None] * num_cases  # Initialize with placeholders
-
+        breakpoint()
         if num_cases == 0:
             logger.warning("Empty inputs provided.")
             return [], []
@@ -828,6 +828,7 @@ class PythonSandbox:
                         metadata_list[i]["status"] = "compile_error_skipped"
 
         logger.info(f"Correctness check finished. Results: {results}")
+        breakpoint()
         return results, metadata_list
 
     async def execute_code(
@@ -837,11 +838,16 @@ class PythonSandbox:
         code, timeout=30, language="python", 
         ground_truth=None, local_run=False
     ):
+        # Handle None or empty ground_truth
+        if ground_truth is None:
+            ground_truth = {}
+            
         if "functional" in ground_truth:
             code = code + "\n" + ground_truth["functional"]
             result_status, metadata = await self._process_single_case(
                 0, None, None, sandbox_fusion_url, code, timeout, memory_limit_mb, language, local_run
             )
+            breakpoint()
             if metadata["run_status"] == "Finished":
                 actual_output = metadata["stdout"] + metadata["stderr"]
                 code_status = metadata["api_status"]
@@ -856,7 +862,7 @@ class PythonSandbox:
             total_cases = len(result_status)
             if total_cases == 0:
                 return "No test cases found.", "Success", {"status": "Success", "run_status": "Finished", "stdout": "Test cases pass rate:**0.00**\n No test cases found.", "stderr": "", "results": [], }
-
+            breakpoint()
             passed_count = 0
             first_failure_meta = None
             final_code_status = "Success" # Assume success unless we find a failure
@@ -872,6 +878,8 @@ class PythonSandbox:
                         final_code_status = meta.get("api_status", "Failed")
             
             final_metadata = {}
+            pass_fail_list = [1 if status is True else 0 for status in result_status]
+            final_metadata["pass_fail_list"] = pass_fail_list
             if first_failure_meta is None:
                 stdout_str = f"Test cases pass rate: **1.00**\nAll {total_cases} test cases passed."
                 stderr_str = ""
@@ -881,7 +889,8 @@ class PythonSandbox:
                     "stdout": stdout_str,
                     "stderr": stderr_str,
                     "exit_code": 0,
-                    "status": "success"
+                    "status": "success",
+                    "pass_fail_list": pass_fail_list
                 }
             else:
                 pass_rate = passed_count / total_cases
@@ -912,14 +921,24 @@ class PythonSandbox:
 
             final_actual_output = final_metadata["stdout"]
             final_metadata["results"] = result_status
-            pass_fail_list = [1 if status is True else 0 for status in result_status]
-            final_metadata["pass_fail_list"] = pass_fail_list
             if final_metadata["stderr"]:
                 final_actual_output += "\n#Error Log:\n" + final_metadata["stderr"]
             final_metadata['duration'] = case_duration
                 
             logger.debug(f"Aggregated actual_output: {final_actual_output}")
             return final_actual_output, final_code_status, final_metadata
+        else:
+            # Fallback: no ground_truth or unrecognized format, just execute the code
+            result_status, metadata = await self._process_single_case(
+                0, None, None, sandbox_fusion_url, code, timeout, memory_limit_mb, language, local_run
+            )
+            if metadata["run_status"] == "Finished":
+                actual_output = metadata["stdout"] + metadata["stderr"]
+                code_status = metadata["api_status"]
+                logger.debug(f"actual_output from sandbox (no ground_truth): {actual_output}")
+                return actual_output, code_status, metadata
+            else:
+                return "Execution did not finish", "Not Finished", metadata
 
 
 class ToolRegistry:
