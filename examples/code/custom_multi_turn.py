@@ -1,8 +1,6 @@
 import asyncio
 import copy
 import yaml
-import json
-import inspect
 import logging
 from argparse import Namespace
 from collections.abc import Callable
@@ -10,24 +8,29 @@ from contextlib import contextmanager
 from typing import Any
 
 import numpy as np
-import pybase64
 import sglang_router
 from packaging.version import parse
 from tqdm import tqdm
+from enum import Enum
+from typing import Optional, Any
+from uuid import uuid4
+from .tool_utils.tools import tool_registry
+from .tool_utils.tool_parser import ToolParser, FunctionCall
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.base_types import call_dynamic_filter
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
 from slime.utils.misc import SingletonMeta, load_function
-from slime.utils.processing_utils import encode_image_for_rollout_engine, load_processor, load_tokenizer
+from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.types import Sample
-from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
+from slime.utils.metric_utils import dict_add_prefix
 
 from slime.rollout.rm_hub import async_rm, batched_async_rm
-
+from examples.code.interaction_utils.interactions import BaseInteraction
+from examples.code.interaction_utils.interactions import CodeInteraction
 from .code_metric import CodeMetricGatherer
 
 __all__ = ["generate_rollout"]
@@ -230,14 +233,6 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
-from enum import Enum
-import re
-from abc import ABC, abstractmethod
-from typing import Optional, Any
-from uuid import uuid4
-from .tools import tool_registry, PythonSandbox
-from .tool_parser import ToolParser, FunctionCall, extract_code_blocks_sync
-
 
 class AgentData:
     """
@@ -338,192 +333,6 @@ class AgentState(Enum):
     INTERACTING = "interacting"
     TERMINATED = "terminated"
 
-class BaseInteraction(ABC):
-    # Default role for interaction responses (can be 'user' or 'tool')
-    response_role: str = "tool"
-    
-    def __init__(self, config: dict[str, Any]):
-        self.config = config
-        self.name: str = config.get("name", "interaction_agent")
-        # Allow role to be overridden from config
-        self.response_role = config.get("response_role", self.__class__.response_role)
-
-    async def start_interaction(self, instance_id: Optional[str] = None, **kwargs) -> str:
-        """Create a session instance."""
-        if instance_id is None:
-            return str(uuid4())
-        else:
-            return instance_id
-
-    async def generate_response(
-        self, instance_id: str, messages: list[dict[str, Any]], **kwargs
-    ) -> tuple[bool, str, dict[str, Any], dict[str, Any]]:
-        """
-        Generates a response for the current turn of interaction.
-        Returns:
-        - should_terminate_sequence (bool)
-        - response_content (str)
-        - reward_result (dict): Matches RewardFn format with keys:
-            - reward_value (float): The actual reward value
-            - score (int): 0 or 1 for pass/fail
-            - reward_cat (str): Category like 'accept', 'wrong_answer', 'no_code', etc.
-            - extra_info (CodeExtraInfo): Execution metadata
-        - additional_data (dict)
-        """
-        return False, "", {}, {}
-
-    async def calculate_score(self) -> float:
-        """
-        Calculates a score for the interaction,
-        potentially considering aspects like partial exposure & in-context task switching.
-        should be invoke at turn-level
-        """
-        return 0.0
-
-    async def finalize_interaction(self) -> None:
-        """
-        Finalizes the interaction session and releases any associated state or resources.
-        Simulates: release state
-        """
-        pass
-
-class CodeInteraction(BaseInteraction):
-    def __init__(self, config: dict[str, Any]):
-        super().__init__(config)
-        self.sandbox = PythonSandbox(
-            timeout=config.get("timeout", 10),
-            memory_limit=config.get("memory_limit", "100MB")
-        )
-        self.use_local_sandbox = config.get("local_run", False)
-        self.sandbox_url = config.get("sandbox_url", None)
-        self.response_role: str = "tool"
-    
-    async def generate_response(
-        self, instance_id: str, messages: list[dict[str, Any]], **kwargs
-    ) -> tuple[bool, str, float, dict[str, Any]]:
-        import time
-        from .code_metric import CodeExtraInfo
-        
-        start_time = time.monotonic()
-        sample = kwargs.get("sample")
-        extra_info = CodeExtraInfo()
-        # Extract the last assistant message which should contain code
-        last_msg = messages[-1]
-        
-        # Simple extraction logic: check for code block
-        code_blocks = re.findall(r"```(?:python\n)?(.*?)```", last_msg.get("content", ""), re.DOTALL)
-        if not code_blocks:
-            extra_info.no_code_extract = True
-            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
-            reward_result = dict(
-                reward_value=0.0,
-                score=0,
-                reward_cat="no_code",
-                extra_info=extra_info,
-            )
-            return False, "Please provide python code in a code block.", reward_result, {}
-        
-        code = code_blocks[-1].strip()
-        extra_info.no_code_extract = False
-        extra_info.extracted_code = code
-
-        # Get Ground Truth from sample if available
-        ground_truth = {}
-        time_limit = self.sandbox.timeout
-        memory_limit_mb = self.sandbox.memory_limit if isinstance(self.sandbox.memory_limit, int) else 1024
-        
-        if sample and sample.metadata:
-            try:
-                reward_model = sample.metadata.get('reward_model', {})
-                if 'ground_truth' in reward_model:
-                     ground_truth = json.loads(reward_model['ground_truth'])
-                # Use custom time/memory limits if available
-                if reward_model.get("time_limit"):
-                    time_limit = reward_model["time_limit"]
-                if reward_model.get("memory_limit_mb"):
-                    memory_limit_mb = reward_model["memory_limit_mb"]
-            except Exception as e:
-                logger.warning(f"Failed to load ground truth: {e}")
-
-        # Execute code using PythonSandbox.execute_code
-        try:
-            output, status, meta = await self.sandbox.execute_code(
-                sandbox_fusion_url=self.sandbox_url,
-                memory_limit_mb=memory_limit_mb,
-                code=code,
-                timeout=time_limit,
-                language="python",
-                ground_truth=ground_truth,
-                local_run=self.use_local_sandbox
-            )
-            breakpoint()
-            extra_info.meta_data = meta
-            
-            # Track execution time
-            duration_lst = meta.get("duration", None)
-            if duration_lst is not None:
-                if not isinstance(duration_lst, list):
-                    duration_lst = [duration_lst]
-                extra_info.code_execute_time = sum(duration_lst) / len(duration_lst)
-                extra_info.code_execute_time_max = max(duration_lst)
-
-            # Calculate Reward using aligned logic
-            reward_result = await self.calculate_score(meta, extra_info, status)
-            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
-
-        except Exception as e:
-            logger.warning(f"Error in CodeInteraction: {e}")
-            extra_info.code_reward_error = True
-            extra_info.code_reward_time = round(time.monotonic() - start_time, 4)
-            reward_result = dict(
-                reward_value=0.0,
-                score=0,
-                reward_cat="python_error",
-                extra_info=extra_info,
-                error_details=str(e)
-            )
-            return False, str(e), reward_result, {}
-
-            
-        return reward_result["reward_value"] == 1.0, output, reward_result, meta
-
-    async def calculate_score(self, meta: dict[str, Any], extra_info: "CodeExtraInfo", exec_status: str) -> float:
-        pass_rate = 0.0
-        score = 0
-        answer_reward = 0.0
-        breakpoint()
-        pass_fail_list = meta.get("pass_fail_list", [])
-        if pass_fail_list:
-            extra_info.pass_fail_list = pass_fail_list
-        
-        stdout = meta.get("stdout", "")
-        match_test_pass_rate = re.search(r"pass rate: \*\*(.*?)\*\*", stdout)
-        if match_test_pass_rate:
-            pass_rate = float(match_test_pass_rate.group(1))
-        else:
-            pass_fail_list = meta.get("pass_fail_list", [])
-            if pass_fail_list:
-                pass_rate = sum(pass_fail_list) / len(pass_fail_list)
-            elif meta.get("api_status").lower() == "success":
-                pass_rate = 1.0
-        
-        extra_info.pass_rate = pass_rate
-        
-        if pass_rate == 1.0:
-            score = 1
-            answer_reward = 1.0
-            reward_cat = "accept"
-        elif meta.get("run_status").lower() == "error" or meta.get("exit_code", 0) != 0:
-            reward_cat = "runtime_error"
-        else:
-            reward_cat = "wrong_answer"
-        
-        return dict(
-            reward_value=answer_reward,
-            score=score,
-            reward_cat=reward_cat,
-            extra_info=extra_info,
-        )
 
 
 class AgentLoop:
@@ -860,10 +669,15 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     
     # Initialize interaction if needed
     interaction_config = {
-        "sandbox_url": getattr(args, "sandbox_url", None),
-        "local_run": getattr(args, "sandbox_local_run", False),
-        "timeout": getattr(args, "sandbox_default_time_limit_s", 10),
-        "memory_limit": getattr(args, "sandbox_default_memory_limit_mb", 1024)
+        "tool_config":{
+            "sandbox_url": getattr(args, "sandbox_url", None),
+            "timeout": getattr(args, "sandbox_default_time_limit_s", 10),
+            "memory_limit": getattr(args, "sandbox_default_memory_limit_mb", 1024),
+            "execution_num_workers": getattr(args, "execution_num_workers", 32),
+            "enable_global_rate_limit": getattr(args, "enable_global_rate_limit", False),
+            "execution_rate_limit": getattr(args, "execution_rate_limit", 128)
+        },
+        "use_local_sandbox": getattr(args, "use_local_sandbox", False),
     }
     # For this example, we always use CodeInteraction
     interaction = CodeInteraction(interaction_config)

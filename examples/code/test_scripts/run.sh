@@ -22,7 +22,7 @@ ROLLOUT_ARGS=(
    #I think we should return raw prompt in agentic rollout, 
    #all prompt initialization and formatting should be handled in agentic rollout?
    #--apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":"True"}'
+   --apply-chat-template-kwargs '{"enable_thinking":"False"}'
    #--rollout-shuffle
    --balance-data
    --rm-type deepscaler

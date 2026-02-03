@@ -238,46 +238,6 @@ class HermesToolParser(ToolParser):
         return content, function_calls
 
 
-@ToolParser.register("qwen")
-class QwenToolParser(ToolParser):
-    """
-    Parser for Qwen-style function calls.
-    
-    Qwen models may use specific markers or JSON format for function calls.
-    This is a placeholder that can be extended based on actual Qwen format.
-    """
-    
-    # Qwen often uses ✿FUNCTION✿ or similar markers
-    FUNCTION_PATTERN = re.compile(
-        r"✿FUNCTION✿:\s*(\w+)\s*✿ARGS✿:\s*(\{.*?\})", 
-        re.DOTALL
-    )
-    
-    async def extract_tool_calls(
-        self, 
-        response: str | list[int]
-    ) -> tuple[str, list[FunctionCall]]:
-        """Extract Qwen-style function calls"""
-        text = self._decode_if_needed(response)
-        
-        matches = self.FUNCTION_PATTERN.findall(text)
-        function_calls = []
-        
-        for name, args_str in matches:
-            try:
-                # Validate JSON
-                json.loads(args_str)
-                function_calls.append(FunctionCall(
-                    name=name.strip(),
-                    arguments=args_str
-                ))
-            except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse Qwen function args: {e}")
-        
-        content = self.FUNCTION_PATTERN.sub("", text).strip()
-        return content, function_calls
-
-
 # Convenience function for quick extraction
 async def extract_code_blocks(text: str) -> list[str]:
     """

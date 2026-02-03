@@ -9,22 +9,22 @@ pkill -9 python
 
 set -ex
 
-apt-get install gawk -y
-cp -r /gfs/platform/public/infra/firejail ~
-cd ~/firejail
-while true; do
-   make clean
-   ./configure
-   make
-   make install-strip
-   firejail --version
-   ret=$?
-   if [ $ret -ne 0 ]; then
-       echo 'install firejail failed: $ret'
-   else
-       break
-   fi
-done
+# apt-get install gawk -y
+# cp -r /gfs/space/chatrl/users/wlw_temp/wlw/firejail ~
+# cd ~/firejail
+# while true; do
+#    make clean
+#    ./configure
+#    make
+#    make install-strip
+#    firejail --version
+#    ret=$?
+#    if [ $ret -ne 0 ]; then
+#        echo 'install firejail failed: $ret'
+#    else
+#        break
+#    fi
+# done
 
 export REPO_PATH=/gfs/space/chatrl/users/wlw_temp/slime_code/slime/
 cd ${REPO_PATH}
@@ -61,11 +61,11 @@ export TIMESTAMP=$(date +"%y%m%d%H%M%S")
 
 export train_file=/gfs/platform/public/infra/all_train_w_difficulty_testcase_max30.jsonl
 
-export max_resp_len=$(( 1024 * 12 ))
-export max_context_len=$(( 1024 * 8 ))
+export max_resp_len=$(( 1024 * 10 ))
+export max_context_len=$(( 1024 * 10 ))
 export rollout_batch_size=8
 export global_batch_size=1
-export rollout_num=2
+export rollout_num=1
 export num_steps_per_rollout=1
 export NCCL_GRAPH_REGISTER=0
 

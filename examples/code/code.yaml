@@ -5,11 +5,12 @@ sandbox_default_memory_limit_mb: 1024
 sandbox_use_case_custom_time_limit: true
 sandbox_use_case_custom_memory_limit: true
 
-sandbox_url: http://10.119.28.31:8080/run_code_with_log
+sandbox_url: http://222.223.106.147:20088/run_code_with_log
 
-num_workers: 128
+execution_num_workers: 64
 enable_global_rate_limit: true
-rate_limit: 128
+execution_rate_limit: 128
+use_local_sandbox: false
 
 # for rollout
 code_rollout_max_turn: 2

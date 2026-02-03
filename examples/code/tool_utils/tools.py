@@ -12,6 +12,8 @@ import gc
 import os
 import re
 import subprocess
+import sys
+import shutil
 import yaml
 import time
 import tempfile
@@ -23,11 +25,14 @@ import json
 import threading
 import traceback
 import tempfile
+from contextlib import contextmanager, ExitStack
 from uuid import uuid4
 from contextlib import contextmanager
 import concurrent.futures
 from typing import Any, Optional, Callable, TypeVar
-
+from enum import Enum
+import math
+import ray
 
 DEFAULT_TIMEOUT = 10  # Default compile and run timeout
 MAX_RETRIES = 3
@@ -50,8 +55,174 @@ TOOL_CONFIGS = {
     "cleanup_threshold": 6144,  # 6GB
     "aggressive_cleanup_threshold": 3072,  # 3GB
     "force_cleanup_threshold": 9216,  # 9GB
+
+    # ExecutionWorker settings (Verl pattern)
+    "execution_num_workers": 32,
+    "execution_rate_limit": 32,
+    "enable_global_rate_limit": True,
 }
 
+
+T = TypeVar("T")
+
+
+class PoolMode(Enum):
+    """Execution pool mode."""
+    ThreadMode = 1
+    ProcessMode = 2
+
+def get_k8s_cpu_limit():
+    try:
+        quota = None
+        period = None
+        
+
+        if os.path.isfile('/sys/fs/cgroup/cpu.max'):
+            with open('/sys/fs/cgroup/cpu.max', 'r') as f:
+                content = f.read().strip().split()
+                if content[0] != 'max':
+                    quota = int(content[0])
+                    period = int(content[1])
+        
+
+        elif os.path.isfile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us'):
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'r') as f:
+                quota = int(f.read().strip())
+            with open('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'r') as f:
+                period = int(f.read().strip())
+
+        # Quota / Period = cpu
+        if quota is not None and period is not None and quota > 0:
+            limit = math.ceil(quota / period)
+            return int(limit)
+            
+    except Exception:
+        raise
+
+@ray.remote(concurrency_groups={"acquire": 1, "release": 10})
+class TokenBucketWorker:
+    """
+    Distributed rate limiter using Ray Actor.
+    
+    This implements a token bucket algorithm for global rate limiting across
+    multiple nodes in distributed training. The concurrency groups ensure
+    that acquire operations are serialized while release operations can be
+    more concurrent.
+    
+    Ported from Verl's sandbox_fusion_tools.py
+    """
+    
+    def __init__(self, rate_limit: int):
+        self.rate_limit = rate_limit
+        self.current_count = 0
+        self._semaphore = threading.Semaphore(rate_limit)
+
+    @ray.method(concurrency_group="acquire")
+    def acquire(self):
+        """Acquire a token (blocks if rate limit reached)."""
+        self._semaphore.acquire()
+        self.current_count += 1
+
+    @ray.method(concurrency_group="release")
+    def release(self):
+        """Release a token."""
+        self._semaphore.release()
+        self.current_count -= 1
+
+    def get_current_count(self):
+        """Get current number of active tokens (for observability)."""
+        return self.current_count
+
+
+class ExecutionWorker:
+    """
+    Execution worker with distributed rate limiting.
+    
+    Wraps function execution with optional rate limiting via TokenBucketWorker.
+    When rate_limit_worker is provided, ensures we don't exceed the global
+    rate limit across all nodes in distributed training.
+    """
+    
+    def __init__(self, enable_global_rate_limit: bool = True, rate_limit: int = 32):
+        self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
+
+    def _init_rate_limit(self, rate_limit: int):
+        """Initialize or get existing rate limiter (singleton pattern via Ray)."""
+        return TokenBucketWorker.options(
+            name="sandbox-rate-limiter",
+            get_if_exists=True
+        ).remote(rate_limit)
+
+    def ping(self):
+        """Health check."""
+        return True
+
+    def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
+        """
+        Execute function with rate limiting.
+        
+        Args:
+            fn: Function to execute
+            *fn_args: Positional arguments for fn
+            **fn_kwargs: Keyword arguments for fn
+            
+        Returns:
+            Result of fn(*fn_args, **fn_kwargs)
+        """
+        if self.rate_limit_worker is None:
+            # No rate limiting, just execute
+            try:
+                return fn(*fn_args, **fn_kwargs)
+            except Exception as e:
+                logger.warning(f"Error when executing code: {e}")
+                raise
+        
+        # With rate limiting
+        with ExitStack() as stack:
+            stack.callback(self.rate_limit_worker.release.remote)
+            ray.get(self.rate_limit_worker.acquire.remote())
+            try:
+                return fn(*fn_args, **fn_kwargs)
+            except Exception as e:
+                logger.warning(f"Error when executing code: {e}")
+                raise
+
+
+def init_execution_pool(
+    num_workers: int = 32,
+    enable_global_rate_limit: bool = True,
+    rate_limit: int = 32,
+    mode: PoolMode = PoolMode.ThreadMode
+) -> ray.actor.ActorHandle:
+    """
+    Initialize an execution pool with rate limiting (singleton pattern).
+    
+    Uses Ray named actor with get_if_exists=True to ensure only one
+    ExecutionPool is created per cluster, avoiding the creation of
+    thousands of Ray actors.
+    
+    Args:
+        num_workers: Maximum concurrent executions
+        enable_global_rate_limit: Whether to use global rate limiting
+        rate_limit: Maximum concurrent requests to sandbox API
+        mode: ThreadMode (default) or ProcessMode
+        
+    Returns:
+        Ray actor handle for the execution pool (singleton)
+    """
+    if mode == PoolMode.ThreadMode:
+        return (
+            ray.remote(ExecutionWorker)
+            .options(
+                name="global-execution-pool",  # Named actor for singleton
+                get_if_exists=True,  # Return existing if already created
+                max_concurrency=num_workers
+            )
+            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
+        )
+    else:
+        raise NotImplementedError("Process mode is not implemented yet")
+    
 # Global semaphore for controlling concurrent tool executions
 SEMAPHORE = asyncio.Semaphore(TOOL_CONFIGS["tool_concurrency"])
 
@@ -111,9 +282,21 @@ def check_and_cleanup_memory():
 class PythonSandbox:
     """Python code sandbox, provides safe code execution environment"""
 
-    def __init__(self, timeout: int = 10, memory_limit: str = "100MB"):
+    def __init__(self, 
+                timeout: int = 10,
+                memory_limit: int = 512,
+                execution_num_workers: int = 32,
+                enable_global_rate_limit: bool = True,
+                execution_rate_limit: int = 32,
+                sandbox_url: Optional[str] = None
+                ):
+        
         self.timeout = timeout
         self.memory_limit = memory_limit
+        self.num_workers = execution_num_workers
+        self.enable_global_rate_limit = enable_global_rate_limit
+        self.rate_limit = execution_rate_limit
+        self.sandbox_fusion_url = sandbox_url
         self.allowed_modules = {
             "math",
             "random",
@@ -157,6 +340,12 @@ class PythonSandbox:
             "swift",
             "racket",
         ]
+        self.execution_pool = init_execution_pool(
+            num_workers=self.num_workers,
+            enable_global_rate_limit=self.enable_global_rate_limit,
+            rate_limit=self.rate_limit,
+            mode=PoolMode.ThreadMode,
+        )
 
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
         """Check code safety by scanning for dangerous patterns"""
@@ -233,13 +422,11 @@ class PythonSandbox:
         finally:
             # Clean up temporary directory
             try:
-                import shutil
-
                 shutil.rmtree(temp_dir)
             except Exception:
                 pass
 
-    async def call_local_sandbox_api(
+    def call_local_sandbox_api(
         self,
         code: str,
         stdin: Optional[str],
@@ -247,6 +434,7 @@ class PythonSandbox:
         run_timeout: int,
         memory_limit_mb: int,
         language: str = "python",
+        use_firejail: bool = False,
     ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
         import subprocess
         import tempfile
@@ -259,40 +447,44 @@ class PythonSandbox:
             logger.error(error_msg)
             return None, error_msg
         
-        def prepare_workdir():
-            parent_dir = "/tmp/firejail_code/"
-            os.makedirs(parent_dir, exist_ok=True)
-            workdir = tempfile.mkdtemp(prefix="fj_", dir=parent_dir)
-            full_code = PY_IMPORTS + code
-            script_path = os.path.join(workdir, "main.py")
-            logger.info(f"{log_prefix}Writing code to {script_path}")
-            with open(script_path, "w", encoding="utf-8") as f:
-                f.write(full_code)
-            return workdir
+        # Prepare working directory
+        parent_dir = "/tmp/python_sandbox/"
+        os.makedirs(parent_dir, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix="py_", dir=parent_dir)
         
         try:
-            workdir = await asyncio.to_thread(prepare_workdir)
-                
+            full_code = PY_IMPORTS + code
+            script_path = os.path.join(workdir, "main.py")
+            logger.debug(f"{log_prefix}Writing code to {script_path}")
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write(full_code)
+
+
             result = {
                 "status": "unknown",
                 "run_status": "unknown", 
                 "run_result": None
             }
 
-            cmd = [
-                "firejail",
-                f"--private={workdir}",              # 独立的工作目录
-                "--rlimit-fsize=2m",                # 文件大小限制
-                "--rlimit-nproc=32",
-                "--rlimit-nofile=32",
-                "--quiet",                          # 静默模式
-                f"--timeout=00:00:{run_timeout}",   # 超时设置
-                f"--whitelist={workdir}",           # 白名单工作目录
-                language,                           # 语言（实际上是 python）
-                "main.py",                          # 要执行的脚本
-            ]
-
-            logger.info(f"{log_prefix}Executing with firejail: {' '.join(cmd)}")
+            if use_firejail:
+                cmd = [
+                    "firejail",
+                    f"--private={workdir}",              # 独立的工作目录
+                    "--rlimit-fsize=2m",                # 文件大小限制
+                    "--rlimit-nproc=32",
+                    "--rlimit-nofile=32",
+                    "--quiet",                          # 静默模式
+                    f"--timeout=00:00:{run_timeout}",   # 超时设置
+                    f"--whitelist={workdir}",           # 白名单工作目录
+                    language,                           # 语言（实际上是 python）
+                    "main.py",                          # 要执行的脚本
+                ]
+                cwd = workdir
+                logger.info(f"{log_prefix}Executing with firejail: {' '.join(cmd)}")
+            else:
+                cmd = [sys.executable, script_path]
+                cwd = workdir
+                logger.debug(f"{log_prefix}Executing directly with Python: {' '.join(cmd)}")
             
             # 执行代码
             run_result = {}
@@ -308,34 +500,30 @@ class PythonSandbox:
             if "PYTHONPATH" in env:
                 del env["PYTHONPATH"]
 
-            # 使用 asyncio.create_subprocess_exec 实现非阻塞子进程调用
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=workdir,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.PIPE if stdin else None,
-                env=env,
-            )
             try:
-                stdout_data, stderr_data = await asyncio.wait_for(
-                    process.communicate(input=stdin.encode() if stdin else None),
-                    timeout=run_timeout + 5
-                )
+                proc = subprocess.run(
+                        cmd, 
+                        cwd=workdir, 
+                        stdout=subprocess.PIPE, 
+                        stderr=subprocess.PIPE,
+                        timeout=run_timeout + 5, 
+                        env=env,
+                        input=stdin.encode() if stdin else None,
+                        preexec_fn=lambda: _set_memory_limit(memory_limit_mb)
+                    )
                 duration = time.monotonic() - start_time
-
-                run_result["stdout"] = stdout_data.decode().strip()
-                run_result["stderr"] = stderr_data.decode().strip()
-                run_result["return_code"] = process.returncode
+                    
+                run_result["stdout"] = proc.stdout.decode().strip()
+                run_result["stderr"] = proc.stderr.decode().strip()
+                run_result["return_code"] = proc.returncode
                 run_result["execution_time"] = duration
-                result = {"status": "unknown", "run_result": run_result}
 
-                if process.returncode == 0:
+                if proc.returncode == 0:
                     result["status"] = "Success"
                     run_result["status"] = "Finished"
-                elif process.returncode < 0:
+                elif proc.returncode < 0:
                     import signal
-                    signal_num = -process.returncode
+                    signal_num = -proc.returncode
                     signal_name = signal.Signals(signal_num).name
 
                     result["status"] = "Failed"
@@ -346,29 +534,19 @@ class PythonSandbox:
                     run_result["status"] = "Finished"
 
                 result["run_result"] = run_result
-
-                await asyncio.to_thread(lambda: __import__('shutil').rmtree(workdir, ignore_errors=True))
                 logger.info(f"{log_prefix}Local sandbox execution completed successfully")
                 return result, None
-            except asyncio.TimeoutError:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                
+            except subprocess.TimeoutExpired:
                 duration = time.monotonic() - start_time
                 #logger.warning(f"{log_prefix}Process timed out after {duration:.2f}s")
                 
-                result = {
-                    "status": "Failed", 
-                    "run_result": {
-                        "status": "TimeLimitExceeded",
-                        "stderr": "TimeLimitExceeded",
-                        "stdout": "",
-                        "return_code": -1,
-                        "execution_time": duration
-                    }
-                }
+                result["status"] = "Failed"
+                run_result["status"] = "TimeLimitExceeded"
+                run_result["stderr"] = "TimeLimitExceeded"
+                run_result["execution_time"] = duration
+                run_result["stdout"] = ""
+                run_result["return_code"] = -1
+                result["run_result"] = run_result
                 
                 return result, None
                 
@@ -389,8 +567,14 @@ class PythonSandbox:
                 }
             }
             return result, error_msg
+        finally:
+            # Clean up working directory
+            try:
+                shutil.rmtree(workdir, ignore_errors=True)
+            except Exception:
+                pass
         
-    async def call_sandbox_api(
+    def call_sandbox_api(
         self,
         sandbox_fusion_url: str,
         code: str,
@@ -399,7 +583,7 @@ class PythonSandbox:
         run_timeout: int,
         memory_limit_mb: int,
         language: str = "python",
-    ) -> tuple[Optional[dict[str, Any]], Optional[str]]: 
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:  # <-- Remove request_id parameter
         """
         Calls the remote sandbox API to execute code with retry logic for Gateway Timeout,
         using increasing delay between retries. Logs internal calls with a unique ID.
@@ -417,54 +601,50 @@ class PythonSandbox:
             If successful, response_json is the API's returned JSON object, error_message is None.
             If failed after retries, response_json is None, error_message contains the error information.
         """
-        request_id = str(uuid4())
+        request_id = str(uuid4())  # <-- Generate request_id internally
         log_prefix = f"[Request ID: {request_id}] "  # <-- Create log prefix
+
         if language not in self.SUPPORTED_LANGUAGES:
             error_msg = f"{log_prefix}Unsupported language: {language}"
             logger.error(error_msg)
             return None, error_msg
-        
-        loop = asyncio.get_running_loop()
 
-        def _sync_request():
-            payload = json.dumps(
-                {
-                    "compile_timeout": compile_timeout,
-                    "run_timeout": run_timeout,
-                    "code": PY_IMPORTS + code,
-                    "stdin": stdin,
-                    "memory_limit_MB": memory_limit_mb,
-                    "language": language, 
-                    "files": {},
-                    "fetch_files": [],
-                }
-            )
-            headers = {"Content-Type": "application/json", "Accept": "application/json"}
-            request_timeout = compile_timeout + run_timeout + API_TIMEOUT
-            with requests.Session() as session:
-                return session.post(
-                    sandbox_fusion_url,
-                    headers=headers,
-                    data=payload,
-                    timeout=request_timeout,
-                )
-            
+        payload = json.dumps(
+            {
+                "compile_timeout": compile_timeout,
+                "run_timeout": run_timeout,
+                "code": PY_IMPORTS + code,
+                "stdin": stdin,
+                "memory_limit_MB": memory_limit_mb,
+                "language": language,  # Use the passed language parameter
+                "files": {},
+                "fetch_files": [],
+            }
+        )
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        # Calculate a reasonable request timeout based on compile/run timeouts plus a buffer
+        request_timeout = compile_timeout + run_timeout + API_TIMEOUT
+
         last_error = None  # Store the last error encountered
 
         for attempt in range(MAX_RETRIES):
             try:
                 logger.info(
                     f"{log_prefix}Attempt {attempt + 1}/{MAX_RETRIES}: Calling sandbox API at {sandbox_fusion_url}"
-                )  
-
-                response = await loop.run_in_executor(None, _sync_request)
+                )  # <-- Use internal log_prefix
+                response = requests.post(
+                    sandbox_fusion_url,
+                    headers=headers,
+                    data=payload,
+                    timeout=request_timeout,  # Use the calculated timeout
+                )
 
                 # Check for Gateway Timeout (504) specifically for retrying
                 if response.status_code == 504:
                     last_error = (
                         f"{log_prefix}API Request Error: Gateway Timeout (504) on attempt "
                         f"{attempt + 1}/{MAX_RETRIES}"
-                    ) 
+                    )  # <-- Use internal log_prefix
                     logger.warning(last_error)
                     if attempt < MAX_RETRIES - 1:  # Don't sleep after the last attempt
                         # Calculate increasing delay (e.g., 1s, 2s, 4s, ...) or (1s, 2s, 3s, ...)
@@ -472,7 +652,7 @@ class PythonSandbox:
                         # Exponential backoff: delay = INITIAL_RETRY_DELAY * (2 ** attempt)
                         delay = INITIAL_RETRY_DELAY * (attempt + 1)  # Using linear increase for simplicity
                         logger.info(f"{log_prefix}Retrying after {delay} seconds...")  # <-- Use internal log_prefix
-                        await asyncio.sleep(delay)
+                        time.sleep(delay)
                     continue  # Go to the next retry attempt
 
                 # Check for other HTTP errors (e.g., 4xx, other 5xx)
@@ -481,24 +661,20 @@ class PythonSandbox:
                 # If successful (status code 2xx)
                 logger.info(
                     f"{log_prefix}Sandbox API call successful on attempt {attempt + 1}"
-                ) 
+                )  # <-- Use internal log_prefix
                 return response.json(), None
 
             except requests.exceptions.RequestException as e:
-                last_error = f"{log_prefix}API Request Error: {e}" 
-                break 
+                last_error = f"{log_prefix}API Request Error: {e}"  # <-- Use internal log_prefix
+                break  # Exit retry loop on non-504 request errors
             except json.JSONDecodeError as e:
                 raw_response_text = response.text if "response" in locals() else "N/A"
-                last_error = f"{log_prefix}API Response JSON Decode Error: {e}"  
-                break  
+                last_error = f"{log_prefix}API Response JSON Decode Error: {e}"  # <-- Use internal log_prefix
+                break  # Exit retry loop on JSON decode errors
             except Exception as e:
-                last_error = str(e)
-                # 一般错误不重试或根据需要重试
-                if attempt < MAX_RETRIES -1 and isinstance(e, requests.exceptions.Timeout):
-                     await asyncio.sleep(1)
-                     continue
-                break
-            
+                last_error = f"{log_prefix}Unexpected Error: {e}"  # <-- Use internal log_prefix
+                break  # Exit retry loop on other unexpected errors
+
         # If loop finishes without returning success, return the last recorded error
         logger.error(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")  # <-- Use internal log_prefix
         # Return the error message without the prefix, as the caller doesn't need the internal ID
@@ -506,12 +682,12 @@ class PythonSandbox:
         return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
 
 
-    async def _process_single_case(
+
+    def _process_single_case(
         self,
         case_index: int,
         stdin_data: Any,
         expected_output: Any,
-        sandbox_fusion_url: str,
         generation: str,
         timeout: int,
         memory_limit_mb: int,
@@ -530,10 +706,122 @@ class PythonSandbox:
 
         if fn_name and language == "python":
             # Wrapper assumes stdin_data is a JSON string for function arguments.
-            current_generation_code = yaml.safe_load(open("examples/code/deps/wrapper.yaml"))['python']
-        stdin = None if stdin_data is None else str(stdin_data)
+            wrapper_code = f"""
+import traceback
+from string import *
+from re import *
+from datetime import *
+from collections import *
+from heapq import *
+from bisect import *
+from copy import *
+from math import *
+from random import *
+from statistics import *
+from itertools import *
+from functools import *
+from operator import *
+from io import *
+from sys import *
+from json import *
+from builtins import *
+from typing import *
+import string
+import re
+import datetime
+import collections
+import heapq
+import bisect
+import copy
+import math
+import random
+import statistics
+import itertools
+import functools
+import operator
+import io
+import sys
+import json
+
+# === User's Original Code START ===
+{generation}
+# === User's Original Code END ===
+
+_SANDBOX_FN_NAME = "{fn_name}"
+
+def _execute_user_function():
+    # --- Input Parsing ---
+    _raw_input_str = sys.stdin.read()
+    _args = []
+    if _raw_input_str.strip(): # If there's input
+        try:
+            _args = [json.loads(line) for line in _raw_input_str.split('\\n')]
+        except json.JSONDecodeError as _je:
+            sys.stderr.write(f"WrapperError: Invalid JSON input for '{{_SANDBOX_FN_NAME}}': {{_je}}\\nInput was: "
+                              f"{{_raw_input_str[:200]}}\\n")
+            return None, True # result, error_occurred
+
+    # --- Function Location and Execution ---
+    try:
+        _target_callable = None
+        # Try global scope first
+        if _SANDBOX_FN_NAME in globals():
+            _target_callable = globals()[_SANDBOX_FN_NAME]
+        # Else, if 'Solution' class exists, try to get its method
+        elif 'Solution' in globals():
+            _Solution_class = globals()['Solution']
+            # Attempt to instantiate and get method.
+            # Errors (e.g., Solution not a class, instantiation fails, method missing)
+            # will be caught by the broad except block below.
+            _solution_instance = _Solution_class()
+            _target_callable = getattr(_solution_instance, _SANDBOX_FN_NAME)
+
+        if not _target_callable:
+            sys.stderr.write(f"WrapperError: Function or method '{{_SANDBOX_FN_NAME}}' not found.\\n")
+            return None, True # result, error_occurred
+
+        _fn_result = _target_callable(*_args)
+        return _fn_result, False # result, no_error
+    except Exception: # Catches errors from Solution instantiation, getattr, or function call
+        sys.stderr.write(f"Error during setup or execution of '{{_SANDBOX_FN_NAME}}':\\n{{traceback.format_exc()}}\\n")
+        return None, True # result, error_occurred
+
+if __name__ == '__main__':
+    _result, _error_occurred = _execute_user_function()
+
+    if not _error_occurred:
+        # Serialize result to stdout
+        if isinstance(_result, (dict, list, tuple)) or _result is None:
+            print(json.dumps(_result))
+        elif isinstance(_result, (int, float, str, bool)):
+            print(str(_result)) # Ensure string conversion for print
+        else:
+            # For other types, default to string representation.
+            print(str(_result))
+    # Optional: To explicitly exit with an error code if the sandbox relies on it
+    # else:
+    #    sys.exit(1)
+"""
+            current_generation_code = wrapper_code
+            if stdin_data is None:
+                stdin = None
+            elif isinstance(stdin_data, list):
+                # 针对多参数函数，必须将每个参数转为一行 json
+                stdin = "\n".join(json.dumps(arg) for arg in stdin_data)
+            else:
+                # 针对单个非 list 参数的情况
+                stdin = json.dumps(stdin_data)
+            
+            if isinstance(expected_output, list):
+                expected_output = expected_output[0]
+                
+        else:
+            # Raw IO 模式
+            stdin = None if stdin_data is None else str(stdin_data)
+
+
         if local_run:
-            api_response, error_msg = await self.call_local_sandbox_api(
+            api_response, error_msg = self.call_local_sandbox_api(
                 code=current_generation_code,
                 stdin=stdin,
                 compile_timeout=timeout,
@@ -547,8 +835,8 @@ class PythonSandbox:
                     # logger.debug(f"Case {case_index + 1}: Attempting to acquire semaphore.")
                     with concurrent_semaphore:
                         # logger.debug(f"Case {case_index + 1}: Semaphore acquired. Calling API.")
-                        api_response, error_msg = await self.call_sandbox_api(
-                            sandbox_fusion_url=sandbox_fusion_url,
+                        api_response, error_msg = self.call_sandbox_api(
+                            sandbox_fusion_url=self.sandbox_fusion_url,
                             code=current_generation_code,
                             stdin=stdin,
                             compile_timeout=timeout,
@@ -558,8 +846,8 @@ class PythonSandbox:
                         )
                     # logger.debug(f"Case {case_index + 1}: Semaphore released.")
                 else:
-                    api_response, error_msg = await self.call_sandbox_api(
-                        sandbox_fusion_url=sandbox_fusion_url,
+                    api_response, error_msg = self.call_sandbox_api(
+                        sandbox_fusion_url=self.sandbox_fusion_url,
                         code=current_generation_code,
                         stdin=stdin,
                         compile_timeout=timeout,
@@ -700,9 +988,8 @@ class PythonSandbox:
         return result_status, metadata
 
 
-    async def check_correctness(
+    def check_correctness(
         self,
-        sandbox_fusion_url: str,
         in_outs: Optional[dict],
         generation: str,
         timeout: int = DEFAULT_TIMEOUT,
@@ -730,7 +1017,7 @@ class PythonSandbox:
             metadata_list: A list containing metadata dictionaries for each test case,
                         ordered corresponding to the inputs.
         """
-        logger.info(f"Starting correctness check for generation, {local_run=}")
+        logger.info("Starting correctness check for generation.")
 
         if not in_outs or "inputs" not in in_outs or "outputs" not in in_outs:
             logger.warning("Invalid in_outs format provided.")
@@ -742,7 +1029,7 @@ class PythonSandbox:
         num_cases = len(inputs)
         results = [None] * num_cases  # Initialize with placeholders
         metadata_list = [None] * num_cases  # Initialize with placeholders
-        breakpoint()
+
         if num_cases == 0:
             logger.warning("Empty inputs provided.")
             return [], []
@@ -753,37 +1040,20 @@ class PythonSandbox:
             return [-1] * num_cases, [{"error": "Input/output count mismatch", "case_index": i} for i in range(num_cases)]
 
         first_compile_error_index = -1
+        first_test_error = -1
         
-        # Determine concurrency limit
-        max_workers = min(os.cpu_count() // 2 , len(inputs)) if local_run else max(32, os.cpu_count() * 5)
-        
-        # Use asyncio.Semaphore to limit concurrency, mimicking ThreadPoolExecutor behavior
-        sem = asyncio.Semaphore(max_workers)
-
-        async def sem_process_single_case(i, *args):
-            async with sem:
-                try:
-                    return await self._process_single_case(i, *args)
-                except Exception as e:
-                    logger.error(f"Test case {i} generated an exception: {e}")
-                    traceback.print_exc()
-                    return -1, {
-                        "case_index": i,
-                        "input": str(args[0]),
-                        "expected_output": str(args[1]),
-                        "api_request_error": f"Internal execution error: {e}",
-                        "status": "internal_error",
-                    }
-
-        # Create tasks for all inputs
-        tasks = []
-        for i, stdin_data in enumerate(inputs):
-            tasks.append(
-                sem_process_single_case(
+        #local run -- cpu_bound    Remote run -- io_bound get_k8s_cpu_limit()
+        max_workers = min(get_k8s_cpu_limit() // 2 , len(inputs)) if local_run else max(32, os.cpu_count() * 5)
+        logger.info(f"Using max_workers={max_workers} for correctness check.")
+        # max_workers is limited by sandbox_fusion_max_concurrent from concurrent_semaphore
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks, passing the concurrent_semaphore to _process_single_case
+            future_to_index = {
+                executor.submit(
+                    self._process_single_case,
                     i,
                     stdin_data,
                     expected_outputs[i],
-                    sandbox_fusion_url,
                     generation,
                     timeout,
                     memory_limit_mb,
@@ -791,21 +1061,34 @@ class PythonSandbox:
                     local_run,
                     concurrent_semaphore,
                     fn_name,
-                )
-            )
+                ): i
+                for i, stdin_data in enumerate(inputs)
+            }
 
-        # Use asyncio.as_completed to process results as they finish
-        for future in asyncio.as_completed(tasks):
-            result_status, metadata = await future
-            index = metadata["case_index"]
-            
-            results[index] = result_status
-            metadata_list[index] = metadata
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    result_status, metadata = future.result()
+                    results[index] = result_status
+                    metadata_list[index] = metadata
 
 
-            if result_status == -4:
-                if first_compile_error_index == -1 or index < first_compile_error_index:
-                    first_compile_error_index = index    
+                    if result_status == -4:
+                        if first_compile_error_index == -1 or index < first_compile_error_index:
+                            first_compile_error_index = index
+
+                except Exception as exc:
+                    logger.error(f"Test case {index} generated an exception: {exc}")
+                    traceback.print_exc()
+                    results[index] = -1  # Mark as API/internal error
+                    metadata_list[index] = {
+                        "case_index": index,
+                        "input": str(inputs[index]),
+                        "expected_output": str(expected_outputs[index]),
+                        "api_request_error": f"Internal execution error: {exc}",
+                        "status": "internal_error",
+                    }    
         # Post-processing for compile errors
         if first_compile_error_index != -1:
             logger.warning(
@@ -831,12 +1114,14 @@ class PythonSandbox:
         breakpoint()
         return results, metadata_list
 
-    async def execute_code(
+    def execute_code(
         self,
-        sandbox_fusion_url,
-        memory_limit_mb,
-        code, timeout=30, language="python", 
-        ground_truth=None, local_run=False
+        code,
+        memory_limit_mb, 
+        timeout=30, 
+        language="python", 
+        ground_truth=None, 
+        local_run=False
     ):
         # Handle None or empty ground_truth
         if ground_truth is None:
@@ -844,8 +1129,8 @@ class PythonSandbox:
             
         if "functional" in ground_truth:
             code = code + "\n" + ground_truth["functional"]
-            result_status, metadata = await self._process_single_case(
-                0, None, None, sandbox_fusion_url, code, timeout, memory_limit_mb, language, local_run
+            result_status, metadata = self._process_single_case(
+                0, None, None, code, timeout, memory_limit_mb, language, local_run
             )
             breakpoint()
             if metadata["run_status"] == "Finished":
@@ -856,13 +1141,14 @@ class PythonSandbox:
             else:
                 return "no stdout here", "Not Finished", metadata
         elif "inputs" in ground_truth and "outputs" in ground_truth:
-            result_status, metadata = await self.check_correctness(
-                sandbox_fusion_url, ground_truth,  code, timeout, memory_limit_mb, language, local_run
+            result_status, metadata = self.check_correctness(
+                ground_truth,  code, timeout, memory_limit_mb, language, local_run
             )
+            breakpoint()
             total_cases = len(result_status)
             if total_cases == 0:
                 return "No test cases found.", "Success", {"status": "Success", "run_status": "Finished", "stdout": "Test cases pass rate:**0.00**\n No test cases found.", "stderr": "", "results": [], }
-            breakpoint()
+
             passed_count = 0
             first_failure_meta = None
             final_code_status = "Success" # Assume success unless we find a failure
@@ -926,11 +1212,12 @@ class PythonSandbox:
             final_metadata['duration'] = case_duration
                 
             logger.debug(f"Aggregated actual_output: {final_actual_output}")
+            breakpoint()
             return final_actual_output, final_code_status, final_metadata
         else:
             # Fallback: no ground_truth or unrecognized format, just execute the code
-            result_status, metadata = await self._process_single_case(
-                0, None, None, sandbox_fusion_url, code, timeout, memory_limit_mb, language, local_run
+            result_status, metadata = self._process_single_case(
+                0, None, None, code, timeout, memory_limit_mb, language, local_run
             )
             if metadata["run_status"] == "Finished":
                 actual_output = metadata["stdout"] + metadata["stderr"]
@@ -940,6 +1227,13 @@ class PythonSandbox:
             else:
                 return "Execution did not finish", "Not Finished", metadata
 
+    async def execute(self, code, memory_limit_mb, timeout, language, ground_truth, local_run, **kwargs) -> tuple[str, float, dict]:
+
+        code = code.strip()
+        if not isinstance(code, str):
+            code = str(code)
+        actual_output, code_status, meta_data = await self.execution_pool.execute.remote(self.execute_code,code, memory_limit_mb, timeout, language, ground_truth, local_run)
+        return actual_output, code_status, meta_data
 
 class ToolRegistry:
     """Tool registry, manages available tools and their execution"""

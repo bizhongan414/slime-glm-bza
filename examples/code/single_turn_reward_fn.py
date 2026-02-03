@@ -5,7 +5,7 @@ import json
 import time
 from types import SimpleNamespace
 
-from .tools import tool_registry
+from examples.code.tool_utils.tools import tool_registry
 from .code_metric import CodeExtraInfo
 from .sandbox_utils import execute_code
 
