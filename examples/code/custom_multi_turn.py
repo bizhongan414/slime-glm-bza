@@ -51,8 +51,8 @@ def initialize_system_prompt(tokenizer) -> list[int]:
     """
     Pre-calculate system prompt tokens for efficient incremental tokenization.
     
-    This follows verl's approach: by computing the token difference between
-    a single message and two identical messages, we can extract the "prefix"
+    by computing the token difference between a single message and two 
+    identical messages, we can extract the "prefix"
     that the chat template adds (system prompt, special tokens, etc.).
     
     When tokenizing new messages incrementally, we can slice off these prefix
@@ -239,7 +239,6 @@ class AgentData:
     Encapsulates all state variables for the agent loop.
     
     AgentData is passed through state handlers and can be accessed by tools.
-    This design follows verl's pattern for cleaner state management.
     
     Attributes:
         messages: Conversation history as list of message dicts
@@ -340,7 +339,6 @@ class AgentLoop:
     Manages the lifecycle of a single sample's rollout:
     Generate -> Tool Execution -> Observation -> Generate ...
     
-    Refactored to use AgentData for state management and verl-style
     state handlers that return the next AgentState.
     """
     def __init__(self, 
@@ -370,7 +368,6 @@ class AgentLoop:
         # Get apply_chat_template_kwargs from args (supports both CLI --apply-chat-template-kwargs
         self.apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
 
-        # Cache system prompt tokens for incremental tokenization (verl-style)
         # This allows us to slice off prefix tokens when tokenizing new messages incrementally
         self.system_prompt_tokens = initialize_system_prompt(state_manager.tokenizer)
         self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
@@ -383,10 +380,7 @@ class AgentLoop:
     ) -> list[int]:
         """
         Apply chat template with optional system prompt removal for incremental tokenization.
-        
-        This follows verl's pattern: when tokenizing new messages (tool responses, 
-        user messages) to append to existing prompt_ids, we remove the system prompt
-        prefix so tokens can be cleanly concatenated.
+    
         
         Args:
             messages: List of message dicts to tokenize
@@ -674,8 +668,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             "timeout": getattr(args, "sandbox_default_time_limit_s", 10),
             "memory_limit": getattr(args, "sandbox_default_memory_limit_mb", 1024),
             "execution_num_workers": getattr(args, "execution_num_workers", 32),
-            "enable_global_rate_limit": getattr(args, "enable_global_rate_limit", False),
-            "execution_rate_limit": getattr(args, "execution_rate_limit", 128)
         },
         "use_local_sandbox": getattr(args, "use_local_sandbox", False),
     }

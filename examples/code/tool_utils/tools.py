@@ -46,20 +46,18 @@ TOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 16,
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
+
     # Python interpreter settings
-    "python_timeout": 120,  # 2 minutes for complex calculations
-    "python_memory_limit": "4GB",  # 4GB per Python process
+    "python_timeout": 30,  # 30s for complex calculations
+    "python_memory_limit": 512,  # 512MB per Python process
     "python_cpu_limit": 1,
     # Memory management settings
     "max_memory_usage": 12288,  # 12GB total (75% of 16GB)
     "cleanup_threshold": 6144,  # 6GB
     "aggressive_cleanup_threshold": 3072,  # 3GB
     "force_cleanup_threshold": 9216,  # 9GB
-
-    # ExecutionWorker settings (Verl pattern)
-    "execution_num_workers": 32,
-    "execution_rate_limit": 32,
-    "enable_global_rate_limit": True,
+    "execution_num_workers": 32, #concurrency
+    "sandbox_fusion_url": "http://222.223.106.147:20088/run_code_with_log"
 }
 
 
@@ -99,67 +97,22 @@ def get_k8s_cpu_limit():
     except Exception:
         raise
 
-@ray.remote(concurrency_groups={"acquire": 1, "release": 10})
-class TokenBucketWorker:
-    """
-    Distributed rate limiter using Ray Actor.
-    
-    This implements a token bucket algorithm for global rate limiting across
-    multiple nodes in distributed training. The concurrency groups ensure
-    that acquire operations are serialized while release operations can be
-    more concurrent.
-    
-    Ported from Verl's sandbox_fusion_tools.py
-    """
-    
-    def __init__(self, rate_limit: int):
-        self.rate_limit = rate_limit
-        self.current_count = 0
-        self._semaphore = threading.Semaphore(rate_limit)
-
-    @ray.method(concurrency_group="acquire")
-    def acquire(self):
-        """Acquire a token (blocks if rate limit reached)."""
-        self._semaphore.acquire()
-        self.current_count += 1
-
-    @ray.method(concurrency_group="release")
-    def release(self):
-        """Release a token."""
-        self._semaphore.release()
-        self.current_count -= 1
-
-    def get_current_count(self):
-        """Get current number of active tokens (for observability)."""
-        return self.current_count
-
-
+@ray.remote
 class ExecutionWorker:
     """
-    Execution worker with distributed rate limiting.
+    Execution worker for sandboxed code execution.
     
-    Wraps function execution with optional rate limiting via TokenBucketWorker.
-    When rate_limit_worker is provided, ensures we don't exceed the global
-    rate limit across all nodes in distributed training.
+    Uses Ray's max_concurrency for rate limiting instead of TokenBucketWorker,
+    which is more efficient for single-instance design (no RPC overhead).
     """
     
-    def __init__(self, enable_global_rate_limit: bool = True, rate_limit: int = 32):
-        self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
-
-    def _init_rate_limit(self, rate_limit: int):
-        """Initialize or get existing rate limiter (singleton pattern via Ray)."""
-        return TokenBucketWorker.options(
-            name="sandbox-rate-limiter",
-            get_if_exists=True
-        ).remote(rate_limit)
-
     def ping(self):
         """Health check."""
         return True
 
     def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
         """
-        Execute function with rate limiting.
+        Execute function.
         
         Args:
             fn: Function to execute
@@ -169,57 +122,37 @@ class ExecutionWorker:
         Returns:
             Result of fn(*fn_args, **fn_kwargs)
         """
-        if self.rate_limit_worker is None:
-            # No rate limiting, just execute
-            try:
-                return fn(*fn_args, **fn_kwargs)
-            except Exception as e:
-                logger.warning(f"Error when executing code: {e}")
-                raise
-        
-        # With rate limiting
-        with ExitStack() as stack:
-            stack.callback(self.rate_limit_worker.release.remote)
-            ray.get(self.rate_limit_worker.acquire.remote())
-            try:
-                return fn(*fn_args, **fn_kwargs)
-            except Exception as e:
-                logger.warning(f"Error when executing code: {e}")
-                raise
+        try:
+            return fn(*fn_args, **fn_kwargs)
+        except Exception as e:
+            logger.warning(f"Error when executing code: {e}")
+            raise
 
 
 def init_execution_pool(
     num_workers: int = 32,
-    enable_global_rate_limit: bool = True,
-    rate_limit: int = 32,
     mode: PoolMode = PoolMode.ThreadMode
 ) -> ray.actor.ActorHandle:
     """
-    Initialize an execution pool with rate limiting (singleton pattern).
+    Initialize an execution pool (singleton pattern).
     
     Uses Ray named actor with get_if_exists=True to ensure only one
-    ExecutionPool is created per cluster, avoiding the creation of
-    thousands of Ray actors.
+    ExecutionPool is created per cluster. Rate limiting is handled by
+    max_concurrency, no need for separate TokenBucketWorker.
     
     Args:
-        num_workers: Maximum concurrent executions
-        enable_global_rate_limit: Whether to use global rate limiting
-        rate_limit: Maximum concurrent requests to sandbox API
+        num_workers: Maximum concurrent executions (used as max_concurrency)
         mode: ThreadMode (default) or ProcessMode
         
     Returns:
         Ray actor handle for the execution pool (singleton)
     """
     if mode == PoolMode.ThreadMode:
-        return (
-            ray.remote(ExecutionWorker)
-            .options(
-                name="global-execution-pool",  # Named actor for singleton
-                get_if_exists=True,  # Return existing if already created
-                max_concurrency=num_workers
-            )
-            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
-        )
+        return ExecutionWorker.options(
+            name="global-execution-pool",  # Named actor for singleton
+            get_if_exists=True,  # Return existing if already created
+            max_concurrency=num_workers  # This IS the rate limiting
+        ).remote()
     else:
         raise NotImplementedError("Process mode is not implemented yet")
     
@@ -286,16 +219,12 @@ class PythonSandbox:
                 timeout: int = 10,
                 memory_limit: int = 512,
                 execution_num_workers: int = 32,
-                enable_global_rate_limit: bool = True,
-                execution_rate_limit: int = 32,
                 sandbox_url: Optional[str] = None
                 ):
         
         self.timeout = timeout
         self.memory_limit = memory_limit
         self.num_workers = execution_num_workers
-        self.enable_global_rate_limit = enable_global_rate_limit
-        self.rate_limit = execution_rate_limit
         self.sandbox_fusion_url = sandbox_url
         self.allowed_modules = {
             "math",
@@ -342,8 +271,6 @@ class PythonSandbox:
         ]
         self.execution_pool = init_execution_pool(
             num_workers=self.num_workers,
-            enable_global_rate_limit=self.enable_global_rate_limit,
-            rate_limit=self.rate_limit,
             mode=PoolMode.ThreadMode,
         )
 
@@ -1241,7 +1168,10 @@ class ToolRegistry:
     def __init__(self):
         self.tools = {}
         self.python_sandbox = PythonSandbox(
-            timeout=TOOL_CONFIGS["python_timeout"], memory_limit=TOOL_CONFIGS["python_memory_limit"]
+            timeout=TOOL_CONFIGS["python_timeout"],
+            memory_limit=TOOL_CONFIGS["python_memory_limit"],
+            execution_num_workers=TOOL_CONFIGS["execution_num_workers"],
+            sandbox_url=TOOL_CONFIGS["sandbox_fusion_url"],
         )
         self._register_default_tools()
 

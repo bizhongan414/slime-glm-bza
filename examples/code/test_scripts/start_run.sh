@@ -31,7 +31,7 @@ cd ${REPO_PATH}
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export nnodes=1
-export num_gpus_per_node=1
+export num_gpus_per_node=2
 ray start --head \
   --node-ip-address ${MASTER_ADDR} \
   --num-gpus ${num_gpus_per_node} \
@@ -61,12 +61,12 @@ export TIMESTAMP=$(date +"%y%m%d%H%M%S")
 
 export train_file=/gfs/platform/public/infra/all_train_w_difficulty_testcase_max30.jsonl
 
-export max_resp_len=$(( 1024 * 10 ))
-export max_context_len=$(( 1024 * 10 ))
-export rollout_batch_size=8
-export global_batch_size=1
-export rollout_num=1
-export num_steps_per_rollout=1
+export max_resp_len=$(( 1024 * 12 ))
+export max_context_len=$(( 1024 * 12 ))
+export rollout_batch_size=16
+export global_batch_size=32
+export rollout_num=4
+export num_steps_per_rollout=2
 export NCCL_GRAPH_REGISTER=0
 
 # export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=True
