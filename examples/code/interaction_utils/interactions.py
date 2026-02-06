@@ -6,7 +6,7 @@ from examples.code.tool_utils.tools import PythonSandbox
 import json
 import logging
 from typing import Any
-
+from examples.code.global_utils import get_event_loop
 
 
 
@@ -80,6 +80,7 @@ class CodeInteraction(BaseInteraction):
     def __init__(self, config: dict[str, Any]):
         super().__init__(config)
         self.config = config
+        self.loop = get_event_loop()
 
     @classmethod
     def _init_class(cls, config: dict[str, Any]):
@@ -149,7 +150,6 @@ class CodeInteraction(BaseInteraction):
                 ground_truth=ground_truth,
                 local_run=self.use_local_sandbox
             )
-            breakpoint()
             extra_info.meta_data = meta
             
             # Track execution time
@@ -184,7 +184,6 @@ class CodeInteraction(BaseInteraction):
         pass_rate = 0.0
         score = 0
         answer_reward = 0.0
-        breakpoint()
         pass_fail_list = meta.get("pass_fail_list", [])
         if pass_fail_list:
             extra_info.pass_fail_list = pass_fail_list

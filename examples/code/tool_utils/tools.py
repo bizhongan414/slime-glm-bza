@@ -1038,7 +1038,6 @@ if __name__ == '__main__':
                         metadata_list[i]["status"] = "compile_error_skipped"
 
         logger.info(f"Correctness check finished. Results: {results}")
-        breakpoint()
         return results, metadata_list
 
     def execute_code(
@@ -1071,7 +1070,6 @@ if __name__ == '__main__':
             result_status, metadata = self.check_correctness(
                 ground_truth,  code, timeout, memory_limit_mb, language, local_run
             )
-            breakpoint()
             total_cases = len(result_status)
             if total_cases == 0:
                 return "No test cases found.", "Success", {"status": "Success", "run_status": "Finished", "stdout": "Test cases pass rate:**0.00**\n No test cases found.", "stderr": "", "results": [], }
@@ -1139,7 +1137,6 @@ if __name__ == '__main__':
             final_metadata['duration'] = case_duration
                 
             logger.debug(f"Aggregated actual_output: {final_actual_output}")
-            breakpoint()
             return final_actual_output, final_code_status, final_metadata
         else:
             # Fallback: no ground_truth or unrecognized format, just execute the code

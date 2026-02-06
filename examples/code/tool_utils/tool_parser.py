@@ -16,6 +16,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from dataclasses import dataclass
+from examples.code.global_utils import get_event_loop
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,8 @@ class ToolParser(ABC):
                        If None, text-based extraction methods should be used.
         """
         self.tokenizer = tokenizer
-    
+        self.loop = get_event_loop()
+
     @abstractmethod
     async def extract_tool_calls(
         self, 
@@ -88,13 +90,16 @@ class ToolParser(ABC):
         """
         raise NotImplementedError
     
-    def _decode_if_needed(self, response: str | list[int]) -> str:
-        """Convert token ids to string if needed"""
+    async def _decode_if_needed(self, response: str | list[int]) -> str:
+        """Convert token ids to string if needed (async, non-blocking)."""
         if isinstance(response, str):
             return response
         if self.tokenizer is None:
             raise ValueError("Tokenizer required to decode token ids")
-        return self.tokenizer.decode(response, skip_special_tokens=True)
+        # Use run_in_executor to avoid blocking the event loop
+        return await self.loop.run_in_executor(
+            None, lambda: self.tokenizer.decode(response, skip_special_tokens=True)
+        )
     
     @classmethod
     def get_parser(cls, name: str, tokenizer=None) -> "ToolParser":
@@ -167,7 +172,7 @@ class PythonCodeParser(ToolParser):
         Returns:
             Tuple of (content_without_code_blocks, list_of_code_interpreter_calls)
         """
-        text = self._decode_if_needed(response)
+        text = await self._decode_if_needed(response)
         
         matches = self.CODE_BLOCK_PATTERN.findall(text)
         function_calls = []
@@ -209,7 +214,7 @@ class HermesToolParser(ToolParser):
         Expected format:
             <tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>
         """
-        text = self._decode_if_needed(response)
+        text = await self._decode_if_needed(response)
         
         if self.TOOL_CALL_START not in text or self.TOOL_CALL_END not in text:
             return text, []

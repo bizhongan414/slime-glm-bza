@@ -32,6 +32,7 @@ from slime.rollout.rm_hub import async_rm, batched_async_rm
 from examples.code.interaction_utils.interactions import BaseInteraction
 from examples.code.interaction_utils.interactions import CodeInteraction
 from .code_metric import CodeMetricGatherer
+from examples.code.global_utils import get_event_loop
 
 __all__ = ["generate_rollout"]
 
@@ -359,6 +360,9 @@ class AgentLoop:
         self.max_response_length = getattr(args, "rollout_max_response_len", 4096)
         self.max_assistant_turns = getattr(args, "code_max_assistant_turns", None)
         self.max_user_turns = getattr(args, "code_max_user_turns", None)
+        # Parallel tool execution config (following verl pattern)
+        self.max_parallel_calls = getattr(args, "max_parallel_tool_calls", 16)
+        self.max_tool_response_length = getattr(args, "max_tool_response_length", 4096)
         # Extract execution config
         self.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         
@@ -371,8 +375,9 @@ class AgentLoop:
         # This allows us to slice off prefix tokens when tokenizing new messages incrementally
         self.system_prompt_tokens = initialize_system_prompt(state_manager.tokenizer)
         self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
-    
-    def apply_chat_template(
+        self.loop = get_event_loop()
+
+    async def apply_chat_template(
         self,
         messages: list[dict[str, Any]],
         add_generation_prompt: bool = True,
@@ -390,12 +395,15 @@ class AgentLoop:
         Returns:
             List of token IDs
         """
-        prompt_ids = self.state_manager.tokenizer.apply_chat_template(
-            messages,
-            tools=None,
-            tokenize=True,
-            add_generation_prompt=add_generation_prompt,
-            **self.apply_chat_template_kwargs  # User-configurable extra args
+        prompt_ids = await self.loop.run_in_executor(
+            None,
+            lambda: self.state_manager.tokenizer.apply_chat_template(
+                messages,
+                tools=None,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                **self.apply_chat_template_kwargs  # User-configurable extra args
+            )
         )
         
         if remove_system_prompt and self.system_prompt_tokens:
@@ -403,7 +411,42 @@ class AgentLoop:
         
         return prompt_ids
 
-
+    async def _call_tool(
+        self, 
+        tool_call: FunctionCall, 
+        agent_data: AgentData
+    ) -> tuple[str, Optional[float]]:
+        """
+        Execute a single tool call and return the response.
+        
+        Following verl's _call_tool pattern for consistent tool execution.
+        
+        Args:
+            tool_call: The FunctionCall to execute
+            agent_data: Agent state (can be used by tools for context)
+            
+        Returns:
+            Tuple of (result_text, tool_reward)
+        """
+        tool_reward = None
+        try:
+            tool_name = tool_call.name
+            tool_args = tool_call.get_arguments_dict()
+            
+            # Execute via tool registry
+            result = await tool_registry.execute_tool(tool_name, tool_args)
+            
+            # Truncate long responses if needed (keep tail by default, as final output is often most relevant)
+            if len(result) > self.max_tool_response_length:
+                result = "(truncated)...\n" + result[-self.max_tool_response_length:]
+            
+            return result, tool_reward
+            
+        except Exception as e:
+            logger.warning(f"Error when executing tool '{tool_call.name}': {e}")
+            return f"Error when executing tool: {e}", 0.0
+        
+        
     async def run(self) -> Sample:
         """
         Main entry point for the agent loop.
@@ -450,6 +493,7 @@ class AgentLoop:
                 agent_data.sample.status = Sample.Status.TRUNCATED
         
         # Finalize and return updated sample
+        breakpoint()
         return self._finalize_sample(agent_data)
 
     async def _handle_pending_state(self, agent_data: AgentData) -> AgentState:
@@ -460,7 +504,7 @@ class AgentLoop:
             AgentState.GENERATING to start generation
         """
         # Tokenize the initial prompt
-        prompt_ids =  self.apply_chat_template(
+        prompt_ids = await self.apply_chat_template(
             agent_data.messages, add_generation_prompt=True)
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
@@ -506,7 +550,9 @@ class AgentLoop:
             new_logprobs = [item[0] for item in meta_info["output_token_logprobs"]]
         else:
             # Fallback if no logprobs returned
-            new_tokens = self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+            new_tokens = await self.loop.run_in_executor(
+                None, lambda: self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
+            )
             new_logprobs = [0.0] * len(new_tokens)
         
         # Update AgentData with new response tokens (mask=1 for LLM generated)
@@ -518,7 +564,6 @@ class AgentLoop:
         agent_data.sample.update_from_meta_info(self.args, meta_info)
 
         _, tool_calls = await self.tool_parser.extract_tool_calls(response_text)
-        breakpoint()
         if tool_calls:
             agent_data.current_tool_calls = tool_calls
             return AgentState.PROCESSING_TOOLS
@@ -538,26 +583,59 @@ class AgentLoop:
         agent_data.turn_idx += 1
         agent_data.user_turns += 1
         
-        logger.debug(f"Executing tool (turn {agent_data.turn_idx})")
+        num_tool_calls = len(agent_data.current_tool_calls)
+        logger.debug(f"Executing {num_tool_calls} tool calls with max_parallel={self.max_parallel_calls} (turn {agent_data.turn_idx})")
         
-        # Execute the last tool call (typically code_interpreter)
-        if agent_data.current_tool_calls:
-            tool_call = agent_data.current_tool_calls[-1]
-            tool_args = tool_call.get_arguments_dict()
+        if not agent_data.current_tool_calls:
+            agent_data.current_tool_calls = []
+            return AgentState.GENERATING
+        
+        # Create semaphore for concurrency control
+        semaphore = asyncio.Semaphore(self.max_parallel_calls)
+        
+        async def call_tool_with_semaphore(idx: int, tool_call: FunctionCall) -> tuple[int, str, Optional[float]]:
+            """Execute tool with semaphore-controlled concurrency, return with index for ordering."""
+            async with semaphore:
+                result_text, tool_reward = await self._call_tool(tool_call, agent_data)
+                return idx, result_text, tool_reward
+        
+        # Create tasks for ALL tool calls (not truncated)
+        tasks = [
+            call_tool_with_semaphore(i, tc) 
+            for i, tc in enumerate(agent_data.current_tool_calls)
+        ]
+        
+        # Execute all tool calls with controlled parallelism
+        indexed_responses = await asyncio.gather(*tasks)
+        
+         # Sort by original index to preserve order
+        indexed_responses = sorted(indexed_responses, key=lambda x: x[0])
+        
+        # Process tool responses and build messages (in original order)
+        add_messages = []
+        for idx, result_text, tool_reward in indexed_responses:
+            # Format observation message (use 'tool' role for tool responses)
+            observation_message = {
+                "role": "tool",
+                "content": f"Execution Output:\n{result_text}"
+            }
+            add_messages.append(observation_message)
             
-            result = await tool_registry.execute_tool(tool_call.name, tool_args)
-        else:
-            result = "No tool call to execute"
-        
-        # Format observation message (use 'tool' role for tool responses, per OpenAI chat format)
-        observation_message = {
-            "role": "tool",
-            "content": f"Execution Output:\n{result}"
-        }
-        agent_data.messages.append(observation_message)
+            # Track tool rewards if provided
+            if tool_reward is not None:
+                if not hasattr(agent_data, 'tool_rewards'):
+                    agent_data.tool_rewards = []
+                agent_data.tool_rewards.append(tool_reward)
 
-        # Incremental tokenization: tokenize only the new message, remove system prefix
-        obs_tokens = self.apply_chat_template([observation_message], add_generation_prompt=True, remove_system_prompt=True)
+                
+        # Add all tool response messages to conversation
+        agent_data.messages.extend(add_messages)
+
+        obs_tokens = await self.apply_chat_template(
+            add_messages, 
+            add_generation_prompt=True, 
+            remove_system_prompt=True
+        )
         
         # Update accumulated prompt_ids (for next generation)
         agent_data.prompt_ids.extend(obs_tokens)
@@ -571,7 +649,7 @@ class AgentLoop:
         agent_data.current_tool_calls = []
         
         return AgentState.GENERATING
-
+        
     async def _handle_interacting_state(self, agent_data: AgentData) -> AgentState:
         """
         Handle interaction with environment/user.
@@ -590,7 +668,6 @@ class AgentLoop:
         )
         agent_data.turn_idx += 1
         agent_data.user_turns += 1
-        breakpoint()
         if response_text:
             # Use the interaction's configured response_role (default: 'tool')
             role = agent_data.interaction.response_role
@@ -598,7 +675,7 @@ class AgentLoop:
             agent_data.messages.append(interaction_message)
             
             # Incremental tokenization for interaction response
-            response_tokens = self.apply_chat_template([interaction_message], add_generation_prompt=True, remove_system_prompt=True)
+            response_tokens = await self.apply_chat_template([interaction_message], add_generation_prompt=True, remove_system_prompt=True)
             
             # Update accumulated prompt_ids (for next generation)
             agent_data.prompt_ids.extend(response_tokens)
@@ -630,9 +707,26 @@ class AgentLoop:
         """
         sample = agent_data.sample
         
+        # Truncate response data if exceeds max_response_length
+        # This ensures the returned trajectory doesn't exceed the configured limit
+        if agent_data.total_response_length > self.max_response_length:
+            logger.debug(
+                f"Truncating response from {agent_data.total_response_length} "
+                f"to {self.max_response_length} tokens"
+            )
+            agent_data.response_ids = agent_data.response_ids[:self.max_response_length]
+            agent_data.response_mask = agent_data.response_mask[:self.max_response_length]
+            agent_data.response_logprobs = agent_data.response_logprobs[:self.max_response_length]
+            # Also update prompt_ids to remove truncated response tokens
+            # prompt_ids = initial_prompt + all_response_tokens, so we need to keep only
+            # the initial prompt part + truncated response
+            initial_prompt_len = len(agent_data.prompt_ids) - agent_data.total_response_length
+            if initial_prompt_len > 0:
+                agent_data.prompt_ids = agent_data.prompt_ids[:initial_prompt_len + self.max_response_length]
+                
         # Set tokens and masks using AgentData helper methods
         sample.tokens = agent_data.get_full_token_sequence()
-        sample.loss_mask = agent_data.get_response_loss_mask() #loss mask in slime is only for response part
+        sample.loss_mask = agent_data.get_response_loss_mask()  # loss mask in slime is only for response part
         sample.rollout_log_probs = agent_data.get_response_log_probs()
         sample.response_length = agent_data.total_response_length
         
@@ -645,6 +739,7 @@ class AgentLoop:
             "_user_turns": agent_data.user_turns,
             "_assistant_turns": agent_data.assistant_turns,
             "_effective_response_length": agent_data.effective_response_length,
+            "_truncated": sample.status == Sample.Status.TRUNCATED,
         }
         
         return sample
@@ -905,7 +1000,7 @@ async def generate_rollout_async(
     if args.rollout_all_samples_process_path is not None:
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
-
+    breakpoint()
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
 
 

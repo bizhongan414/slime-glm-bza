@@ -47,7 +47,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 1
    # --pipeline-model-parallel-size 2
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -99,13 +99,8 @@ MISC_ARGS=(
    # should be good for model performance
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
-   # need to comment this when using model with MLA
-   # --attention-backend flash
 
-   #--moe-token-dispatcher-type flex
-   #--moe-enable-deepep
-   # --no-rope-fusion
-   # --apply-rope-fusion False
+   --log-probs-chunk-size 1024
 )
 
 CUSTOM_ARGS=(
@@ -132,7 +127,7 @@ ray job submit --address="http://127.0.0.1:8265" \
         "OMPI_MCA_plm_rsh_no_tree_spawn": "1",
         "OMPI_MCA_oob_tcp_if_include": "${MLP_SOCKET_IFNAME}",
         "OMPI_MCA_btl_tcp_if_include": "${MLP_SOCKET_IFNAME}",
-        "RAY_DEBUG": "0"
+        "RAY_DEBUG": "1"
      }
    }' \
    -- python3 train.py \
@@ -140,7 +135,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --tensorboard-dir ${TENSORBOARD_DIR} \
    --actor-num-nodes ${nnodes} \
    --num-gpus-per-node ${num_gpus_per_node} \
-   --actor-num-gpus-per-node 2 \
+   --actor-num-gpus-per-node 1 \
    --reward-key reward_value \
    --colocate \
    ${MODEL_ARGS[@]} \
