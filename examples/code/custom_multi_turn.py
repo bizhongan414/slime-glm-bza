@@ -16,6 +16,7 @@ from typing import Optional, Any
 from uuid import uuid4
 from .tool_utils.tools import tool_registry
 from .tool_utils.tool_parser import ToolParser, FunctionCall
+from .tool_utils.chat_formatter import ChatTemplateFormatter
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import call_dynamic_filter
@@ -372,9 +373,25 @@ class AgentLoop:
         # Get apply_chat_template_kwargs from args (supports both CLI --apply-chat-template-kwargs
         self.apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
 
-        # This allows us to slice off prefix tokens when tokenizing new messages incrementally
-        self.system_prompt_tokens = initialize_system_prompt(state_manager.tokenizer)
-        self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
+        # Initialize chat formatter (default: use tokenizer.apply_chat_template directly)
+        # When chat_formatter_name is specified, use the registered formatter instead
+        chat_formatter_name = getattr(args, "chat_formatter_name", None)
+        if chat_formatter_name:
+            formatter_kwargs = getattr(args, "chat_formatter_kwargs", {}) or {}
+            self.chat_formatter = ChatTemplateFormatter.get_formatter(
+                chat_formatter_name,
+                state_manager.tokenizer,
+                apply_chat_template_kwargs=self.apply_chat_template_kwargs,
+                **formatter_kwargs
+            )
+            self.system_prompt_tokens = self.chat_formatter.get_system_prompt_tokens()
+            self.generation_prompt_tokens = self.chat_formatter.get_generation_prompt_tokens()
+        else:
+            # Backward compatible: no formatter, use existing logic
+            self.chat_formatter = None
+            self.system_prompt_tokens = initialize_system_prompt(state_manager.tokenizer)
+            self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
+        
         self.loop = get_event_loop()
 
     async def apply_chat_template(
@@ -395,16 +412,27 @@ class AgentLoop:
         Returns:
             List of token IDs
         """
-        prompt_ids = await self.loop.run_in_executor(
-            None,
-            lambda: self.state_manager.tokenizer.apply_chat_template(
-                messages,
-                tools=None,
-                tokenize=True,
-                add_generation_prompt=add_generation_prompt,
-                **self.apply_chat_template_kwargs  # User-configurable extra args
+        # Use chat formatter if configured, otherwise use tokenizer directly
+        if self.chat_formatter:
+            prompt_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.chat_formatter.encode_messages(
+                    messages,
+                    add_generation_prompt=add_generation_prompt
+                )
             )
-        )
+        else:
+            # Backward compatible: use tokenizer.apply_chat_template directly
+            prompt_ids = await self.loop.run_in_executor(
+                None,
+                lambda: self.state_manager.tokenizer.apply_chat_template(
+                    messages,
+                    tools=None,
+                    tokenize=True,
+                    add_generation_prompt=add_generation_prompt,
+                    **self.apply_chat_template_kwargs  # User-configurable extra args
+                )
+            )
         
         if remove_system_prompt and self.system_prompt_tokens:
             prompt_ids = prompt_ids[len(self.system_prompt_tokens):]

@@ -243,6 +243,96 @@ class HermesToolParser(ToolParser):
         return content, function_calls
 
 
+@ToolParser.register("deepseek_dsml")
+class DeepSeekDSMLParser(ToolParser):
+    """
+    Parser for DeepSeek V3.2 DSML tool call format.
+    
+    DSML format uses ｜DSML｜ tags for structured tool calls:
+    <｜DSML｜function_calls>
+    <｜DSML｜invoke name="function_name">
+    <｜DSML｜parameter name="param" string="true">value</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+    
+    Based on encoding_dsv32.py reference implementation.
+    """
+    
+    DSML_TOKEN = "｜DSML｜"
+    
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        # Regex patterns for parsing
+        self.function_calls_pattern = re.compile(
+            r"<｜DSML｜function_calls>(.*?)</｜DSML｜function_calls>", 
+            re.DOTALL
+        )
+        self.invoke_pattern = re.compile(
+            r'<｜DSML｜invoke name="([^"]+)">(.*?)</｜DSML｜invoke>', 
+            re.DOTALL
+        )
+        self.parameter_pattern = re.compile(
+            r'<｜DSML｜parameter name="([^"]+)" string="(true|false)">(.*?)</｜DSML｜parameter>', 
+            re.DOTALL
+        )
+    
+    async def extract_tool_calls(
+        self, 
+        response: str | list[int]
+    ) -> tuple[str, list[FunctionCall]]:
+        """
+        Extract DeepSeek DSML-style tool calls.
+        
+        Args:
+            response: LLM response text or token ids
+            
+        Returns:
+            Tuple of (content_without_tool_calls, list_of_function_calls)
+        """
+        text = await self._decode_if_needed(response)
+        
+        # Check if there are any function calls
+        if f"<{self.DSML_TOKEN}function_calls>" not in text:
+            return text, []
+        
+        function_calls = []
+        
+        # Find all function_calls blocks
+        blocks = self.function_calls_pattern.findall(text)
+        
+        for block in blocks:
+            # Find all invoke elements in this block
+            invokes = self.invoke_pattern.findall(block)
+            
+            for tool_name, invoke_content in invokes:
+                # Parse parameters
+                params = self.parameter_pattern.findall(invoke_content)
+                arguments = {}
+                
+                for param_name, is_string, param_value in params:
+                    if is_string == "true":
+                        # String value - use as-is
+                        arguments[param_name] = param_value
+                    else:
+                        # Non-string value - parse as JSON
+                        try:
+                            arguments[param_name] = json.loads(param_value)
+                        except json.JSONDecodeError:
+                            # Fallback to string if JSON parsing fails
+                            logger.warning(f"Failed to parse parameter as JSON: {param_value}")
+                            arguments[param_name] = param_value
+                
+                function_calls.append(FunctionCall(
+                    name=tool_name,
+                    arguments=json.dumps(arguments, ensure_ascii=False)
+                ))
+        
+        # Remove function_calls blocks from content
+        content = self.function_calls_pattern.sub("", text).strip()
+        
+        return content, function_calls
+
+
 # Convenience function for quick extraction
 async def extract_code_blocks(text: str) -> list[str]:
     """
@@ -271,3 +361,4 @@ def extract_code_blocks_sync(text: str) -> list[str]:
     """
     matches = PythonCodeParser.CODE_BLOCK_PATTERN.findall(text)
     return [m.strip() for m in matches if m.strip()]
+
