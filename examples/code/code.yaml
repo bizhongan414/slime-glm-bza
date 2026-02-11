@@ -1,4 +1,4 @@
-tool_names: [code_interpreter]
+tool_names: [code_interpreter] #[code_interpreter]
 interaction_name: null
 tool_parser_name: deepseek_dsml
 chat_formatter_class: examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter
@@ -16,7 +16,7 @@ execution_num_workers: 64
 use_local_sandbox: false
 
 # for rollout
-code_rollout_max_turn: 3
+rollout_max_turn: 4
 code_feedback_message_filepath: examples/code/deps/multi_turn_feedback.yaml # 默认 examples/code/deps/multi_turn_feedback.yaml
 code_feedback_message_version: v0
 

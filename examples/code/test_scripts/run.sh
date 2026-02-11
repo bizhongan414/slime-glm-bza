@@ -16,13 +16,15 @@ CKPT_ARGS=(
 ROLLOUT_ARGS=(
    --rollout-function-path examples.code.custom_multi_turn.generate_rollout
    --prompt-data /gfs/space/chatrl/users/wlw_temp/verl/verl/experimental/agent_loop/tool_call_test_cases.jsonl
+   #--prompt-data /gfs/space/chatrl/users/hxh/data/math_data/dapo-math/prompts/dapo-math-17k_dedup_no_prompt.jsonl
+   #--prompt-data /gfs/space/chatrl/users/wlw_temp/wlw/data/slime/DeepCoder-Preview-Dataset_wlw/taco/train.jsonl
    --input-key messages
    --label-key answer
 
    #I think we should return raw prompt in agentic rollout, 
    #all prompt initialization and formatting should be handled in agentic rollout?
    #--apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":"True"}'
+   --apply-chat-template-kwargs '{"enable_thinking":false}'
    #--rollout-shuffle
    --balance-data
    --rm-type dapo
@@ -33,6 +35,8 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout ${num_steps_per_rollout}
    --rollout-max-response-len ${max_resp_len}
    --rollout-temperature 1
+
+   --save-debug-rollout-data ./debug_onegpu/exp1_rollout_{rollout_id}.pt
 )
 
 EVAL_ARGS=(
@@ -128,7 +132,7 @@ ray job submit --address="http://127.0.0.1:8265" \
         "OMPI_MCA_plm_rsh_no_tree_spawn": "1",
         "OMPI_MCA_oob_tcp_if_include": "${MLP_SOCKET_IFNAME}",
         "OMPI_MCA_btl_tcp_if_include": "${MLP_SOCKET_IFNAME}",
-        "RAY_DEBUG": "1"
+        "RAY_DEBUG": "0"
      }
    }' \
    -- python3 train.py \

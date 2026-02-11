@@ -1163,7 +1163,7 @@ CODE_INTERPRETER_SPEC = {
     "type": "function",
     "function": {
         "name": "code_interpreter",
-        "description": "A tool for executing Python code in a safe sandbox environment.",
+        "description": "A tool for executing Python code in a safe sandbox environment. Returns the standard output of the executed code.",
         "parameters": {
             "type": "object",
             "properties": {"code": {"type": "string", "description": "The Python code to execute"}},

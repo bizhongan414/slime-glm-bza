@@ -262,7 +262,7 @@ def verify(
 def compute_score(
     solution_str: str,
     ground_truth: str,
-    strict_box_verify: bool = False,
+    strict_box_verify: bool = True,
     pause_tokens_index: list[int] | None = None,
 ) -> float:
     """Compute the reward score for a solution.

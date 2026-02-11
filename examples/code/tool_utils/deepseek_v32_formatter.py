@@ -123,7 +123,7 @@ class DeepSeekV32Formatter(ChatTemplateFormatter):
     def __init__(
         self, 
         tokenizer, 
-        thinking_mode: str = "thinking",
+        thinking_mode: str = "chat",
         add_default_bos_token: bool = True,
         **kwargs
     ):

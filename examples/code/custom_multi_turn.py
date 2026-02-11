@@ -363,7 +363,7 @@ class AgentLoop:
         self.interaction = interaction
         self.tool_registry = tool_registry
         
-        self.max_turns = getattr(args, "code_rollout_max_turn", 5)
+        self.max_turns = getattr(args, "rollout_max_turn", 5)
         self.max_response_length = getattr(args, "rollout_max_response_len", 4096)
         self.max_assistant_turns = getattr(args, "code_max_assistant_turns", None)
         self.max_user_turns = getattr(args, "code_max_user_turns", None)
@@ -454,6 +454,7 @@ class AgentLoop:
                     add_generation_prompt=add_generation_prompt
                 )
             )
+            breakpoint()
         else:
             # Backward compatible: use tokenizer.apply_chat_template directly
             prompt_ids = await self.loop.run_in_executor(
@@ -466,7 +467,7 @@ class AgentLoop:
                     **self.apply_chat_template_kwargs  # User-configurable extra args
                 )
             )
-        breakpoint()
+            breakpoint()
         if remove_system_prompt and self.system_prompt_tokens:
             prompt_ids = prompt_ids[len(self.system_prompt_tokens):]
         
@@ -557,7 +558,19 @@ class AgentLoop:
                 state = AgentState.TERMINATED
                 agent_data.sample.status = Sample.Status.TRUNCATED
         
-        # Finalize and return updated sample
+
+        # Ensure reward is computed even if interaction was never reached
+        # (e.g., first generation exceeded max_response_len → TERMINATED before INTERACTING)
+        if self.interaction and agent_data.sample.reward is None:
+            try:
+                _, _, reward, _ = await self.interaction.generate_response(
+                    agent_data.request_id, agent_data.messages, sample=agent_data.sample
+                )
+                if reward is not None:
+                    agent_data.sample.reward = reward
+            except Exception as e:
+                logger.warning(f"Failed to compute reward in finalize: {e}")
+        
         breakpoint()
         return self._finalize_sample(agent_data)
 
@@ -728,7 +741,6 @@ class AgentLoop:
             return AgentState.TERMINATED
 
         # Get response from interaction
-
         should_terminate, response_text, reward, meta = await agent_data.interaction.generate_response(
             agent_data.request_id, agent_data.messages, sample=agent_data.sample
         )
@@ -754,7 +766,7 @@ class AgentLoop:
         # Handle reward
         if reward is not None:
             agent_data.sample.reward = reward
-        
+        breakpoint()
         if should_terminate:
             return AgentState.TERMINATED
         else:
