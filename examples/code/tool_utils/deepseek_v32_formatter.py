@@ -4,7 +4,7 @@ DeepSeek V3.2 Chat Template Formatter with DSML tool call format.
 This module provides:
 - DeepSeekV32Formatter: Formatter for DeepSeek V3.2's special DSML format
 - Supports thinking mode with <think></think> tags
-- Handles |DSML| format for tool calls
+- Handles ｜DSML｜ format for tool calls
 
 Based on encoding_dsv32.py reference implementation.
 """
@@ -38,6 +38,13 @@ You can invoke functions by writing a "<{dsml_token}function_calls>" block like 
 </{dsml_token}function_calls>
 
 String and scalar parameters should be specified as is without any escaping or quotes, while lists and objects should use JSON format. The "string" attribute should be set to "true" for string type parameters and "false" for other types (numbers, booleans, arrays, objects).
+
+**Important: Tool Usage Guidelines**
+- You should ALWAYS prefer using tools over reasoning alone when the task involves computation, data processing, or verification.
+- Do NOT attempt to mentally compute, simulate, or guess results that a tool can provide accurately. Use the tool instead.
+- When solving problems, write code to verify your approach rather than relying solely on your reasoning.
+- If a task can be broken into steps, use tools at each step to validate intermediate results.
+- Even if you are confident in your reasoning, use tools to double-check your answer when possible.
 
 If the thinking_mode is enabled, then after function results you should strongly consider outputting a thinking block. Here is an example:
 
@@ -82,13 +89,12 @@ def _tool_calls_from_openai_format(tool_calls: list[dict]) -> list[dict]:
     ]
 
 
-@ChatTemplateFormatter.register("deepseek_v32")
 class DeepSeekV32Formatter(ChatTemplateFormatter):
     """
     DeepSeek V3.2 specific formatter with DSML tool call format.
     
     Supports:
-    - DSML format for tool calls (|DSML| tags)
+    - DSML format for tool calls (｜DSML｜ tags)
     - Thinking mode with <think></think> tags
     - Incremental encoding with context
     
@@ -96,16 +102,16 @@ class DeepSeekV32Formatter(ChatTemplateFormatter):
     """
     
     # Special tokens
-    BOS_TOKEN = "<|begin▁of▁sentence|>"
-    EOS_TOKEN = "<|end▁of▁sentence|>"
+    BOS_TOKEN = "<｜begin▁of▁sentence｜>"
+    EOS_TOKEN = "<｜end▁of▁sentence｜>"
     THINKING_START = "<think>"
     THINKING_END = "</think>"
-    DSML_TOKEN = "|DSML|"
+    DSML_TOKEN = "｜DSML｜"
     
     # Message templates
     SYSTEM_MSG_TEMPLATE = "{content}"
-    USER_MSG_TEMPLATE = "<|User|>{content}<|Assistant|>"
-    ASSISTANT_MSG_TEMPLATE = "{reasoning}{content}{tool_calls}<|end▁of▁sentence|>"
+    USER_MSG_TEMPLATE = "<｜User｜>{content}<｜Assistant｜>"
+    ASSISTANT_MSG_TEMPLATE = "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"
     THINKING_TEMPLATE = "{reasoning_content}"
     
     # Tool templates
@@ -156,6 +162,7 @@ class DeepSeekV32Formatter(ChatTemplateFormatter):
         Returns:
             List of token ids
         """
+        breakpoint()
         context = context if context else []
         full_messages = context + messages
         
@@ -167,7 +174,8 @@ class DeepSeekV32Formatter(ChatTemplateFormatter):
             prompt += self._render_message(idx + len(context), full_messages)
         
         # Encode to token ids
-        return self.tokenizer.encode(prompt, add_special_tokens=False)
+        tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
+        return tokens
     
     def get_system_prompt_tokens(self) -> list[int]:
         """Get pre-calculated system prompt tokens."""
@@ -282,6 +290,7 @@ class DeepSeekV32Formatter(ChatTemplateFormatter):
             # This allows rendering without needing context (previous assistant message)
             
             # Count consecutive tool messages ending at current index
+            breakpoint()
             tool_messages_end = index
             tool_messages_start = index
             while tool_messages_start > 0 and messages[tool_messages_start - 1].get("role") == "tool":
@@ -303,9 +312,12 @@ class DeepSeekV32Formatter(ChatTemplateFormatter):
             
             if tool_order == tool_count:
                 prompt += "\n</function_results>"
-                # NOTE: Don't add <think> or </think> here - that's for the model to output
-                # The model will generate </think> or continue thinking as appropriate
-        
+                # Add generation prompt after tool results (matching encoding_dsv32.py)
+                if index >= last_user_idx and self.thinking_mode == "thinking":
+                    prompt += "\n\n" + self.THINKING_START
+                else:
+                    prompt += "\n\n" + self.THINKING_END
+
         elif role == "assistant":
             thinking_part = ""
             tool_calls_content = ""

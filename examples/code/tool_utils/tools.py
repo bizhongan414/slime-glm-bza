@@ -1139,7 +1139,6 @@ if __name__ == '__main__':
             logger.debug(f"Aggregated actual_output: {final_actual_output}")
             return final_actual_output, final_code_status, final_metadata
         else:
-            # Fallback: no ground_truth or unrecognized format, just execute the code
             result_status, metadata = self._process_single_case(
                 0, None, None, code, timeout, memory_limit_mb, language, local_run
             )
@@ -1159,76 +1158,111 @@ if __name__ == '__main__':
         actual_output, code_status, meta_data = await self.execution_pool.execute.remote(self.execute_code,code, memory_limit_mb, timeout, language, ground_truth, local_run)
         return actual_output, code_status, meta_data
 
+# Tool specification constants
+CODE_INTERPRETER_SPEC = {
+    "type": "function",
+    "function": {
+        "name": "code_interpreter",
+        "description": "A tool for executing Python code in a safe sandbox environment.",
+        "parameters": {
+            "type": "object",
+            "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
+            "required": ["code"],
+        },
+    },
+}
+
+
 class ToolRegistry:
-    """Tool registry, manages available tools and their execution"""
+    """Tool registry, manages available tools and their execution."""
 
     def __init__(self):
         self.tools = {}
-        self.python_sandbox = PythonSandbox(
-            timeout=TOOL_CONFIGS["python_timeout"],
-            memory_limit=TOOL_CONFIGS["python_memory_limit"],
-            execution_num_workers=TOOL_CONFIGS["execution_num_workers"],
-            sandbox_url=TOOL_CONFIGS["sandbox_fusion_url"],
-        )
-        self._register_default_tools()
+        self._executors = {}  # name -> executor instance (e.g. PythonSandbox)
 
-    def _register_default_tools(self):
-        """Register default tools in the registry"""
-        # Python code interpreter
-        self.register_tool(
-            "code_interpreter",
-            {
-                "type": "function",
-                "function": {
-                    "name": "code_interpreter",
-                    "description": "A tool for executing Python code in a safe sandbox environment.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
-                        "required": ["code"],
-                    },
-                },
-            },
-        )
-
-    def register_tool(self, name: str, tool_spec: dict[str, Any]):
-        """Register a new tool in the registry"""
+    def register_tool(self, name: str, tool_spec: dict[str, Any], executor=None):
+        """Register a tool with its spec and optional executor.
+        
+        Args:
+            name: Tool name
+            tool_spec: OpenAI-format tool specification dict
+            executor: Optional executor instance for tool execution
+        """
         self.tools[name] = tool_spec
+        if executor is not None:
+            self._executors[name] = executor
 
     def get_tool_specs(self) -> list[dict[str, Any]]:
-        """Get all tool specifications as a list"""
+        """Get all tool specifications as a list."""
         return list(self.tools.values())
 
     async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool call with the given arguments"""
+        """Execute a tool call with the given arguments."""
         if tool_name not in self.tools:
             return f"Error: Tool '{tool_name}' not found"
 
+        executor = self._executors.get(tool_name)
+        if executor is None:
+            return f"Error: Tool '{tool_name}' has no executor registered"
+
         async with SEMAPHORE:
             if tool_name == "code_interpreter":
-                return await self._execute_python(arguments)
+                return await self._execute_python(executor, arguments)
             else:
-                return f"Error: Tool '{tool_name}' not implemented"
+                return f"Error: Tool '{tool_name}' execution not implemented"
 
-    async def _execute_python(self, arguments: dict[str, Any]) -> str:
-        """Execute Python code using the sandbox"""
+    async def _execute_python(self, sandbox: PythonSandbox, arguments: dict[str, Any]) -> str:
+        """Execute Python code using the provided sandbox."""
         code = arguments.get("code", "")
+        breakpoint()
         if not code.strip():
             return "Error: No code provided"
 
-        # Execute code in sandbox
-        result = await self.python_sandbox.execute_code(
-            sandbox_fusion_url=self.sandbox_url,
-            memory_limit_mb=4096, # Pass default memory limit
+        # Convert literal \n (two chars: backslash + n) to real newlines
+        # Models sometimes output escaped newlines in DSML parameter values
+        code = code.replace("\\n", "\n")
+        
+        result = await sandbox.execute(
+            memory_limit_mb=sandbox.memory_limit if isinstance(sandbox.memory_limit, int) else 1024,
             code=code,
-            timeout=TOOL_CONFIGS["python_timeout"],
-            ground_truth=None # No ground truth for direct interpreter execution
+            timeout=sandbox.timeout,
+            language="python",
+            ground_truth=None,
+            local_run=False
         )
-        # Extract the output string from the tuple result (output, status, metadata)
         if isinstance(result, tuple) and len(result) >= 1:
             return str(result[0])
         return str(result)
 
 
-# Global tool registry instance
-tool_registry = ToolRegistry()
+def initialize_tools_from_args(args) -> ToolRegistry:
+    """Initialize tool registry based on args.
+    
+    Args:
+        args: Namespace with:
+            - tool_names: list[str] or None, tools to register (default: None = no tools)
+            - sandbox_url, sandbox_default_time_limit_s, etc. for sandbox config
+    
+    Returns:
+        Configured ToolRegistry instance (empty if tool_names is None)
+    """
+    registry = ToolRegistry()
+    tool_names = getattr(args, "tool_names", None)
+    
+    if not tool_names:
+        return registry
+    
+    for name in tool_names:
+        if name == "code_interpreter":
+            sandbox = PythonSandbox(
+                timeout=getattr(args, "sandbox_default_time_limit_s", 10),
+                memory_limit=getattr(args, "sandbox_default_memory_limit_mb", 1024),
+                execution_num_workers=getattr(args, "execution_num_workers", 32),
+                sandbox_url=getattr(args, "sandbox_url", None),
+            )
+            registry.register_tool("code_interpreter", CODE_INTERPRETER_SPEC, executor=sandbox)
+        else:
+            logger.warning(f"Unknown tool: {name}, skipping registration")
+    
+    return registry
+

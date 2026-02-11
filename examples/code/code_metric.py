@@ -45,7 +45,8 @@ class CodeMetricGatherer:
             self.pass_rate_lst.append(code_extra_info.pass_rate)
     
     def log_code_sample_train_metadata(self, samples):
-        self.log_code_execute_status([sample.reward['extra_info'] for sample in samples])
+        if isinstance(samples[0].reward, dict) and 'extra_info' in samples[0].reward:
+            self.log_code_execute_status([sample.reward['extra_info'] for sample in samples])
         for sample in samples:
             self.success_at_turn.append(sample.train_metadata['_turn_idx'])
 
@@ -64,7 +65,8 @@ class CodeMetricGatherer:
             for reason, count in self._dynamic_filter_drop_reason_count.items()
         }
         tot = len(self.code_reward_time_lst)
-        
+        if tot == 0:
+            return metrics
         correct_lst = [1 if p==1.0 else 0 for p in self.pass_rate_lst]
         successful_turns = [turn for turn in self.success_at_turn if turn > 0]
 

@@ -3,6 +3,7 @@ from abc import ABC
 from typing import Optional, Any
 from uuid import uuid4
 from examples.code.tool_utils.tools import PythonSandbox
+from examples.code.interaction_utils.interaction_registry import InteractionRegistry
 import json
 import logging
 from typing import Any
@@ -76,6 +77,7 @@ class BaseInteraction(ABC):
         """
         pass
 
+@InteractionRegistry.register("code")
 class CodeInteraction(BaseInteraction):
     def __init__(self, config: dict[str, Any]):
         super().__init__(config)

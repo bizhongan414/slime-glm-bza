@@ -3,11 +3,12 @@ Chat template formatter module for handling model-specific message encoding.
 
 This module provides:
 - ChatTemplateFormatter: Abstract base class for chat template formatting
-- DefaultChatFormatter: Default implementation using tokenizer.apply_chat_template
 
-Design aligned with existing tool_parser.py patterns and ToolParser registry.
+Formatters are loaded via full class path (e.g. 
+examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter).
 """
 
+import importlib
 import logging
 from abc import ABC, abstractmethod
 from typing import Any, Optional
@@ -26,14 +27,13 @@ class ChatTemplateFormatter(ABC):
     - Handle model-specific special tokens and formats
     
     Usage:
-        @ChatTemplateFormatter.register("my_formatter")
-        class MyFormatter(ChatTemplateFormatter):
-            ...
-        
-        formatter = ChatTemplateFormatter.get_formatter("my_formatter", tokenizer)
+        formatter = ChatTemplateFormatter.get_formatter(
+            "examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter",
+            tokenizer,
+            thinking_mode="thinking"
+        )
         tokens = formatter.encode_messages(messages)
     """
-    _registry: dict[str, type["ChatTemplateFormatter"]] = {}
     
     def __init__(self, tokenizer, **kwargs):
         """
@@ -86,12 +86,13 @@ class ChatTemplateFormatter(ABC):
         raise NotImplementedError
     
     @classmethod
-    def get_formatter(cls, name: str, tokenizer, **kwargs) -> "ChatTemplateFormatter":
+    def get_formatter(cls, class_path: str, tokenizer, **kwargs) -> "ChatTemplateFormatter":
         """
-        Get formatter instance by name.
+        Get formatter instance by full class path, using dynamic import.
         
         Args:
-            name: Registered formatter name
+            class_path: Full qualified class path 
+                        (e.g. "examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter")
             tokenizer: Tokenizer for the formatter
             **kwargs: Additional configuration for the formatter
             
@@ -99,33 +100,22 @@ class ChatTemplateFormatter(ABC):
             ChatTemplateFormatter instance
             
         Raises:
-            ValueError: If formatter name is not registered
+            ValueError: If class cannot be imported or is not a valid formatter
         """
-        if name not in cls._registry:
-            available = list(cls._registry.keys())
-            raise ValueError(f"Unknown chat formatter: {name}. Available: {available}")
-        return cls._registry[name](tokenizer, **kwargs)
-    
-    @classmethod
-    def register(cls, name: str):
-        """
-        Decorator to register a formatter class.
+        try:
+            module_path, class_name = class_path.rsplit(".", 1)
+            module = importlib.import_module(module_path)
+            formatter_cls = getattr(module, class_name)
+        except (ImportError, AttributeError, ValueError) as e:
+            raise ValueError(
+                f"Cannot load chat formatter '{class_path}': {e}. "
+                f"Ensure the class path is fully qualified, e.g. "
+                f"'examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter'"
+            ) from e
         
-        Args:
-            name: Name to register the formatter under
-            
-        Example:
-            @ChatTemplateFormatter.register("my_formatter")
-            class MyFormatter(ChatTemplateFormatter):
-                ...
-        """
-        def decorator(subclass: type["ChatTemplateFormatter"]) -> type["ChatTemplateFormatter"]:
-            cls._registry[name] = subclass
-            return subclass
-        return decorator
-    
-    @classmethod
-    def list_formatters(cls) -> list[str]:
-        """List all registered formatter names."""
-        return list(cls._registry.keys())
-
+        if not issubclass(formatter_cls, ChatTemplateFormatter):
+            raise ValueError(
+                f"'{class_path}' is not a subclass of ChatTemplateFormatter"
+            )
+        
+        return formatter_cls(tokenizer, **kwargs)

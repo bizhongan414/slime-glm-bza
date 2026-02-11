@@ -2,7 +2,7 @@
 set -ex
 pwd
 
-source "/gfs/space/chatrl/users/wlw_temp/slime_code/slime/scripts/models/qwen3-4B.sh"
+source "/gfs/space/chatrl/users/wlw_temp/slime_code/slime/scripts/models/qwen3-8B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_PATH}
@@ -15,21 +15,21 @@ CKPT_ARGS=(
 
 ROLLOUT_ARGS=(
    --rollout-function-path examples.code.custom_multi_turn.generate_rollout
-   --prompt-data /gfs/space/chatrl/users/wlw_temp/wlw/data/slime/DeepCoder-Preview-Dataset_wlw/taco/train.jsonl
-   --input-key prompt
-   #--label-key answer
+   --prompt-data /gfs/space/chatrl/users/wlw_temp/verl/verl/experimental/agent_loop/tool_call_test_cases.jsonl
+   --input-key messages
+   --label-key answer
 
    #I think we should return raw prompt in agentic rollout, 
    #all prompt initialization and formatting should be handled in agentic rollout?
    #--apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":"False"}'
+   --apply-chat-template-kwargs '{"enable_thinking":"True"}'
    #--rollout-shuffle
    --balance-data
-   --rm-type deepscaler
+   --rm-type dapo
    --num-rollout 3000
 
    --rollout-batch-size ${rollout_batch_size}
-   --n-samples-per-prompt ${rollout_num}
+   --n-samples-per-prompt ${rollout_n}
    --num-steps-per-rollout ${num_steps_per_rollout}
    --rollout-max-response-len ${max_resp_len}
    --rollout-temperature 1
@@ -38,6 +38,7 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=(
 #    --eval-interval 20
    --eval-prompt-data humaneval /gfs/space/chatrl/users/wlw_temp/wlw/data/slime/humaneval_codeinmd/humaneval_codeinmd.jsonl
+   #--eval-prompt-data dapo /gfs/space/chatrl/users/hxh/data/math_data/dapo-math/prompts/dapo-math-17k_dedup_no_prompt.jsonl
    --eval-input-key prompt
    --n-samples-per-eval-prompt 1
    --eval-max-response-len ${max_resp_len}
@@ -104,7 +105,7 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-rm-path examples.code.single_turn_reward_fn.reward_fn
+   #--custom-rm-path examples.code.single_turn_reward_fn.reward_fn
    --custom-config-path examples/code/code.yaml
 )
 
@@ -136,7 +137,6 @@ ray job submit --address="http://127.0.0.1:8265" \
    --actor-num-nodes ${nnodes} \
    --num-gpus-per-node ${num_gpus_per_node} \
    --actor-num-gpus-per-node 1 \
-   --reward-key reward_value \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

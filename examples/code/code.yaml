@@ -1,3 +1,8 @@
+tool_names: [code_interpreter]
+interaction_name: null
+tool_parser_name: deepseek_dsml
+chat_formatter_class: examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter
+
 # for sandbox
 sandbox_local_run: true
 sandbox_default_time_limit_s: 10
@@ -20,5 +25,5 @@ code_use_format_reward: False
 code_use_timeout_reward: False
 
 # override
-reward_key: reward_value
+reward_key: score
 eval_reward_key: score

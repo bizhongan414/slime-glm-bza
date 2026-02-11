@@ -61,11 +61,11 @@ export TIMESTAMP=$(date +"%y%m%d%H%M%S")
 
 export train_file=/gfs/platform/public/infra/all_train_w_difficulty_testcase_max30.jsonl
 
-export max_resp_len=$(( 1024 * 8 ))
-export max_context_len=$(( 1024 * 8 ))
-export rollout_batch_size=8
-export rollout_num=2
-export global_batch_size=16
+export max_resp_len=$(( 1024 * 12 ))
+export max_context_len=$(( 1024 * 12 ))
+export rollout_batch_size=1
+export rollout_n=1
+export global_batch_size=1
 export num_steps_per_rollout=1
 export NCCL_GRAPH_REGISTER=0
 
@@ -80,7 +80,7 @@ export LOG_FILE=${EXP_DIR}/logs/output_${TIMESTAMP}.log
 export CKPT_SAVE_PATH=${EXP_DIR}/checkpoints
 export TENSORBOARD_DIR=${EXP_DIR}/tensorboard_log/GLM-4.7-Flash
 
-export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4B
-export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4Btorch_dist
+export MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B-dist
 
 bash /gfs/space/chatrl/users/wlw_temp/slime_code/slime/examples/code/test_scripts/run.sh

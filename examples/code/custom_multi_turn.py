@@ -14,9 +14,10 @@ from tqdm import tqdm
 from enum import Enum
 from typing import Optional, Any
 from uuid import uuid4
-from .tool_utils.tools import tool_registry
+from .tool_utils.tools import ToolRegistry, initialize_tools_from_args
 from .tool_utils.tool_parser import ToolParser, FunctionCall
 from .tool_utils.chat_formatter import ChatTemplateFormatter
+from examples.code.interaction_utils.interaction_registry import initialize_interactions_from_args
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import call_dynamic_filter
@@ -31,7 +32,6 @@ from slime.utils.metric_utils import dict_add_prefix
 
 from slime.rollout.rm_hub import async_rm, batched_async_rm
 from examples.code.interaction_utils.interactions import BaseInteraction
-from examples.code.interaction_utils.interactions import CodeInteraction
 from .code_metric import CodeMetricGatherer
 from examples.code.global_utils import get_event_loop
 
@@ -200,6 +200,10 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
         self.dp_rank = 0
 
+        # Cached registries (lazy initialized)
+        self._tool_registry = None
+        self._interaction_map = None
+
         self.reset()
 
     @contextmanager
@@ -349,13 +353,15 @@ class AgentLoop:
                  sampling_params: dict[str, Any], 
                  state_manager: 'GenerateState',
                  interaction: Optional[BaseInteraction] = None,
-                 tool_parser_name: str = "hermes"):
+                 tool_parser_name: str = "hermes",
+                 tool_registry: Optional[ToolRegistry] = None):
 
         self.args = args
         self.sample = sample
         self.sampling_params = sampling_params
         self.state_manager = state_manager
         self.interaction = interaction
+        self.tool_registry = tool_registry
         
         self.max_turns = getattr(args, "code_rollout_max_turn", 5)
         self.max_response_length = getattr(args, "rollout_max_response_len", 4096)
@@ -374,12 +380,12 @@ class AgentLoop:
         self.apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
 
         # Initialize chat formatter (default: use tokenizer.apply_chat_template directly)
-        # When chat_formatter_name is specified, use the registered formatter instead
-        chat_formatter_name = getattr(args, "chat_formatter_name", None)
-        if chat_formatter_name:
+        # When chat_formatter_class is specified, dynamically load and use the formatter
+        chat_formatter_class = getattr(args, "chat_formatter_class", None)
+        if chat_formatter_class:
             formatter_kwargs = getattr(args, "chat_formatter_kwargs", {}) or {}
             self.chat_formatter = ChatTemplateFormatter.get_formatter(
-                chat_formatter_name,
+                chat_formatter_class,
                 state_manager.tokenizer,
                 apply_chat_template_kwargs=self.apply_chat_template_kwargs,
                 **formatter_kwargs
@@ -393,6 +399,33 @@ class AgentLoop:
             self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
         
         self.loop = get_event_loop()
+    
+    def _inject_tool_specs(self, messages: list[dict[str, Any]]) -> None:
+        """
+        Inject available tool specs from tool_registry into system message.
+        
+        This allows the model to know which tools are available and their format,
+        without requiring tool definitions in the dataset.
+        
+        Args:
+            messages: The messages list to modify (in-place)
+        """
+        tool_specs = self.tool_registry.get_tool_specs() if self.tool_registry else []
+        if not tool_specs:
+            return
+        
+        # Find or create system message and inject tools
+        if messages and messages[0].get("role") == "system":
+            # Add tools to existing system message
+            if "tools" not in messages[0]:
+                messages[0]["tools"] = tool_specs
+        else:
+            # Insert a system message with tools at the beginning
+            messages.insert(0, {
+                "role": "system",
+                "content": "",
+                "tools": tool_specs
+            })
 
     async def apply_chat_template(
         self,
@@ -433,7 +466,7 @@ class AgentLoop:
                     **self.apply_chat_template_kwargs  # User-configurable extra args
                 )
             )
-        
+        breakpoint()
         if remove_system_prompt and self.system_prompt_tokens:
             prompt_ids = prompt_ids[len(self.system_prompt_tokens):]
         
@@ -462,7 +495,7 @@ class AgentLoop:
             tool_args = tool_call.get_arguments_dict()
             
             # Execute via tool registry
-            result = await tool_registry.execute_tool(tool_name, tool_args)
+            result = await self.tool_registry.execute_tool(tool_name, tool_args)
             
             # Truncate long responses if needed (keep tail by default, as final output is often most relevant)
             if len(result) > self.max_tool_response_length:
@@ -486,14 +519,18 @@ class AgentLoop:
         # Use format_messages_for_agent to handle string/list prompts and optionally add system prompt
         system_prompt = getattr(self.args, "code_system_prompt", None)
         messages = format_messages_for_agent(self.sample.prompt, system_prompt=system_prompt)
-        
+
         agent_data = AgentData(
             messages=messages,
             sample=self.sample,
             request_id=str(uuid4()),
             interaction=self.interaction,
         )
-        
+
+        # Inject tool specs from registry into system message
+        # Controlled by args.inject_tool_specs (default: True)
+        if getattr(self.args, "inject_tool_specs", True):
+            self._inject_tool_specs(agent_data.messages)
         # State machine loop
         state = AgentState.PENDING
         while state != AgentState.TERMINATED:
@@ -624,6 +661,7 @@ class AgentLoop:
         async def call_tool_with_semaphore(idx: int, tool_call: FunctionCall) -> tuple[int, str, Optional[float]]:
             """Execute tool with semaphore-controlled concurrency, return with index for ordering."""
             async with semaphore:
+                breakpoint()
                 result_text, tool_reward = await self._call_tool(tool_call, agent_data)
                 return idx, result_text, tool_reward
         
@@ -664,7 +702,7 @@ class AgentLoop:
             add_generation_prompt=True, 
             remove_system_prompt=True
         )
-        
+        breakpoint()
         # Update accumulated prompt_ids (for next generation)
         agent_data.prompt_ids.extend(obs_tokens)
         
@@ -784,21 +822,24 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         sample.status == Sample.Status.PENDING or sample.status == Sample.Status.ABORTED
     ), f"Sample status is {sample.status}"
     
-    # Initialize interaction if needed
-    interaction_config = {
-        "tool_config":{
-            "sandbox_url": getattr(args, "sandbox_url", None),
-            "timeout": getattr(args, "sandbox_default_time_limit_s", 10),
-            "memory_limit": getattr(args, "sandbox_default_memory_limit_mb", 1024),
-            "execution_num_workers": getattr(args, "execution_num_workers", 32),
-        },
-        "use_local_sandbox": getattr(args, "use_local_sandbox", False),
-    }
-    # For this example, we always use CodeInteraction
-    interaction = CodeInteraction(interaction_config)
+    # Initialize tool registry from args (cached on GenerateState)
+    if state._tool_registry is None:
+        state._tool_registry = initialize_tools_from_args(args)
+    tool_registry = state._tool_registry
+    
+    # Initialize interaction from args (cached on GenerateState)
+    if state._interaction_map is None:
+        state._interaction_map = initialize_interactions_from_args(args)
+    interaction_map = state._interaction_map
+    interaction = list(interaction_map.values())[0] if interaction_map else None
 
     # Initialize and run the Agent Loop
-    agent_loop = AgentLoop(args, sample, sampling_params, state, interaction=interaction)
+    agent_loop = AgentLoop(
+        args, sample, sampling_params, state,
+        interaction=interaction,
+        tool_parser_name=getattr(args, "tool_parser_name", "hermes"),
+        tool_registry=tool_registry,
+    )
     return await agent_loop.run()
 
 
@@ -998,9 +1039,8 @@ async def generate_rollout_async(
 
             # add the samples to the data
             # NOTE: here we have not stored all the unused samples back to the data buffer.
+            breakpoint()
             if len(data) < target_data_size:
-                # code_execute_status_lst = [sample.reward['code_execute_status'] for sample in group]
-                # metric_gatherer.log_code_execute_status(code_execute_status_lst)
                 metric_gatherer.log_code_sample_train_metadata(group)
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)

@@ -289,6 +289,7 @@ class DeepSeekDSMLParser(ToolParser):
         Returns:
             Tuple of (content_without_tool_calls, list_of_function_calls)
         """
+        breakpoint()
         text = await self._decode_if_needed(response)
         
         # Check if there are any function calls
@@ -308,7 +309,7 @@ class DeepSeekDSMLParser(ToolParser):
                 # Parse parameters
                 params = self.parameter_pattern.findall(invoke_content)
                 arguments = {}
-                
+                breakpoint()
                 for param_name, is_string, param_value in params:
                     if is_string == "true":
                         # String value - use as-is
