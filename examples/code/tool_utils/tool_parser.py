@@ -334,6 +334,62 @@ class DeepSeekDSMLParser(ToolParser):
         return content, function_calls
 
 
+@ToolParser.register("qwen3")
+class Qwen3JSONParser(ToolParser):
+    """
+    Parser for Qwen3 series (JSON inside XML format).
+    Matches the official chat_template output.
+    """
+    
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        # 1. 只需要匹配最外层的 <tool_call> 标签
+        self.tool_call_pattern = re.compile(
+            r"<tool_call>(.*?)</tool_call>", 
+            re.DOTALL
+        )
+
+    async def extract_tool_calls(
+        self, 
+        response: str | list[int]
+    ) -> tuple[str, list[FunctionCall]]:
+        
+        text = await self._decode_if_needed(response)
+        function_calls = []
+        
+        # 查找所有 <tool_call> 内容
+        tool_call_blocks = self.tool_call_pattern.findall(text)
+        
+        for block in tool_call_blocks:
+            try:
+                # 2. Qwen3 的内容是纯 JSON，直接 load
+                # block 可能是 '{"name": "func", "arguments": {...}}'
+                tool_data = json.loads(block.strip())
+                
+                # 兼容可能的不同 JSON 结构，通常是 standard format
+                func_name = tool_data.get("name")
+                arguments = tool_data.get("arguments")
+                
+                # 有些时候 arguments 已经是 dict，有些时候是 string，视情况处理
+                if isinstance(arguments, dict):
+                    arguments = json.dumps(arguments, ensure_ascii=False)
+                
+                if func_name:
+                    function_calls.append(FunctionCall(
+                        name=func_name,
+                        arguments=arguments
+                    ))
+            except json.JSONDecodeError:
+                # 容错处理：模型生成的 JSON 可能不合法
+                print(f"Warning: Failed to decode JSON tool call: {block}")
+                continue
+
+        # 3. 清理文本：移除所有工具调用标签，保留纯文本对话（包括 <think>）
+        content = self.tool_call_pattern.sub("", text).strip()
+        
+        return content, function_calls
+    
+
 # Convenience function for quick extraction
 async def extract_code_blocks(text: str) -> list[str]:
     """

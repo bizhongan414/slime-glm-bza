@@ -31,7 +31,7 @@ cd ${REPO_PATH}
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export nnodes=1
-export num_gpus_per_node=1
+export num_gpus_per_node=4
 ray start --head \
   --node-ip-address ${MASTER_ADDR} \
   --num-gpus ${num_gpus_per_node} \
@@ -59,13 +59,12 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 export TIMESTAMP=$(date +"%y%m%d%H%M%S")
 
-export train_file=/gfs/platform/public/infra/all_train_w_difficulty_testcase_max30.jsonl
 
-export max_resp_len=$(( 1024 * 8 ))
-export max_context_len=$(( 1024 * 8 ))
-export rollout_batch_size=10
-export rollout_n=1
-export global_batch_size=10
+export max_resp_len=$(( 1024 * 16 ))
+export max_context_len=$(( 1024 * 16 ))
+export rollout_batch_size=16
+export rollout_n=8
+export global_batch_size=128
 export num_steps_per_rollout=1
 export NCCL_GRAPH_REGISTER=0
 
@@ -76,13 +75,16 @@ export EXP_NAME=for_sandbox_debug
 export project_name=slime_30B-A3B_code_debug_single
 export EXP_DIR=/gfs/space/chatrl/users/wlw_temp/slime_code
 export DUMP_DIR=${EXP_DIR}/dump_details
-export LOG_FILE=${EXP_DIR}/logs/output_${TIMESTAMP}.log
+export LOG_FILE=${EXP_DIR}/logs/output_withtool_${TIMESTAMP}.log
 export CKPT_SAVE_PATH=${EXP_DIR}/checkpoints
-export TENSORBOARD_DIR=${EXP_DIR}/tensorboard_log/GLM-4.7-Flash
+export TENSORBOARD_DIR=${EXP_DIR}/tensorboard_log/qwen3-8B_tool_${TIMESTAMP}
 
-export MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
-export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B-dist
+# export MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+# export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B-dist
 
 # export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4B
 # export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4Btorch_dist
+
+export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B
+export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B-dist
 bash /gfs/space/chatrl/users/wlw_temp/slime_code/slime/examples/code/test_scripts/run.sh

@@ -1310,6 +1310,29 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             temp_args, _ = temp_parser.parse_known_args()
             sglang_tp_size = temp_args.rollout_num_gpus_per_engine
             return sglang_tp_size
+        
+
+        def add_remote_reward_model_arguments(parser):  
+            parser.add_argument(  
+                "--rm-api-key",  
+                type=str,  
+                default=None,  
+                help="API key for the remote reward model service",  
+            )
+            parser.add_argument(  
+                "--rm-base-url",   
+                type=str,  
+                default=None,  
+                help="Base URL for reward model API"  
+            )  
+            parser.add_argument(  
+                "--rm-model-name",  
+                type=str,  
+                default=None,  
+                help="Model name for reward model API"  
+            )
+            return parser
+        
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
         if add_custom_arguments is not None:
@@ -1334,6 +1357,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_prefill_decode_disaggregation_arguments(parser)
         parser = add_ci_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
+        parser = add_remote_reward_model_arguments(parser)
         reset_arg(
             parser,
             "--custom-config-path",

@@ -379,8 +379,7 @@ class AgentLoop:
         # Get apply_chat_template_kwargs from args (supports both CLI --apply-chat-template-kwargs
         self.apply_chat_template_kwargs = getattr(args, "apply_chat_template_kwargs", {}) or {}
 
-        # Initialize chat formatter (default: use tokenizer.apply_chat_template directly)
-        # When chat_formatter_class is specified, dynamically load and use the formatter
+
         chat_formatter_class = getattr(args, "chat_formatter_class", None)
         if chat_formatter_class:
             formatter_kwargs = getattr(args, "chat_formatter_kwargs", {}) or {}
@@ -398,6 +397,13 @@ class AgentLoop:
             self.system_prompt_tokens = initialize_system_prompt(state_manager.tokenizer)
             self.generation_prompt_tokens = extract_generation_prompt(state_manager.tokenizer)
         
+        # Tool injection method: "text" (default) or "native" (pass to apply_chat_template)
+        self.tool_injection_method = getattr(args, "tool_injection_method", "text")
+
+        self.tool_schemas = None
+        if self.tool_injection_method == "native" and self.tool_registry:
+            self.tool_schemas = self.tool_registry.to_openai_tools()
+
         self.loop = get_event_loop()
     
     def _inject_tool_specs(self, messages: list[dict[str, Any]]) -> None:
@@ -410,6 +416,10 @@ class AgentLoop:
         Args:
             messages: The messages list to modify (in-place)
         """
+        if self.tool_injection_method == "native":
+             # "native" method relies on apply_chat_template handling tools, so we skip text injection
+             return
+
         tool_specs = self.tool_registry.get_tool_specs() if self.tool_registry else []
         if not tool_specs:
             return
@@ -426,10 +436,10 @@ class AgentLoop:
                 "content": "",
                 "tools": tool_specs
             })
-
     async def apply_chat_template(
         self,
         messages: list[dict[str, Any]],
+        tools: list[dict] = None,
         add_generation_prompt: bool = True,
         remove_system_prompt: bool = False,
     ) -> list[int]:
@@ -456,18 +466,19 @@ class AgentLoop:
             )
             breakpoint()
         else:
-            # Backward compatible: use tokenizer.apply_chat_template directly
+
             prompt_ids = await self.loop.run_in_executor(
                 None,
                 lambda: self.state_manager.tokenizer.apply_chat_template(
                     messages,
-                    tools=None,
+                    tools=tools,
                     tokenize=True,
                     add_generation_prompt=add_generation_prompt,
                     **self.apply_chat_template_kwargs  # User-configurable extra args
                 )
             )
             breakpoint()
+        
         if remove_system_prompt and self.system_prompt_tokens:
             prompt_ids = prompt_ids[len(self.system_prompt_tokens):]
         
@@ -583,7 +594,9 @@ class AgentLoop:
         """
         # Tokenize the initial prompt
         prompt_ids = await self.apply_chat_template(
-            agent_data.messages, add_generation_prompt=True)
+            agent_data.messages, 
+            tools=self.tool_schemas,
+            add_generation_prompt=True)
         agent_data.prompt_ids = prompt_ids
         return AgentState.GENERATING
 
@@ -619,7 +632,7 @@ class AgentLoop:
         
         # Append assistant response to message history
         agent_data.messages.append({"role": "assistant", "content": response_text})
-        agent_data.sample.response = response_text
+        agent_data.sample.response += response_text
         agent_data.assistant_turns += 1
 
         # Extract and track new tokens
@@ -640,7 +653,7 @@ class AgentLoop:
         agent_data.response_logprobs.extend(new_logprobs)
 
         agent_data.sample.update_from_meta_info(self.args, meta_info)
-
+        breakpoint()
         _, tool_calls = await self.tool_parser.extract_tool_calls(response_text)
         if tool_calls:
             agent_data.current_tool_calls = tool_calls
@@ -699,7 +712,7 @@ class AgentLoop:
                 "content": f"Execution Output:\n{result_text}"
             }
             add_messages.append(observation_message)
-            
+            agent_data.sample.response += f"Execution Output:\n{result_text}"
             # Track tool rewards if provided
             if tool_reward is not None:
                 if not hasattr(agent_data, 'tool_rewards'):
@@ -750,6 +763,7 @@ class AgentLoop:
             # Use the interaction's configured response_role (default: 'tool')
             role = agent_data.interaction.response_role
             interaction_message = {"role": role, "content": response_text}
+            agent_data.sample.response += response_text
             agent_data.messages.append(interaction_message)
             
             # Incremental tokenization for interaction response
@@ -809,7 +823,7 @@ class AgentLoop:
         sample.response_length = agent_data.total_response_length
         
         # Update conversation history
-        sample.prompt = agent_data.messages
+        #sample.prompt = agent_data.messages
         
         # Set training metadata
         sample.train_metadata = {

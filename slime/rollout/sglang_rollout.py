@@ -118,7 +118,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
         } or None
     else:
-        prompt_ids = state.tokenizer.encode(sample.prompt, add_special_tokens=False)
+        prompt_ids = state.tokenizer.apply_chat_template(sample.prompt, add_special_tokens=False)
 
     if len(sample.response) > 0:
         sampling_params["max_new_tokens"] -= len(sample.tokens) - len(prompt_ids)

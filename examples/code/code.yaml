@@ -1,22 +1,22 @@
 tool_names: [code_interpreter] #[code_interpreter]
 interaction_name: null
-tool_parser_name: deepseek_dsml
-chat_formatter_class: examples.code.tool_utils.deepseek_v32_formatter.DeepSeekV32Formatter
-
+tool_parser_name: qwen3
+chat_formatter_class: null
+tool_injection_method: native
 # for sandbox
 sandbox_local_run: true
-sandbox_default_time_limit_s: 10
+sandbox_default_time_limit_s: 15
 sandbox_default_memory_limit_mb: 1024
 sandbox_use_case_custom_time_limit: true
 sandbox_use_case_custom_memory_limit: true
 
 sandbox_url: http://222.223.106.147:20088/run_code_with_log
 
-execution_num_workers: 64
+execution_num_workers: 128
 use_local_sandbox: false
 
 # for rollout
-rollout_max_turn: 4
+rollout_max_turn: 6
 code_feedback_message_filepath: examples/code/deps/multi_turn_feedback.yaml # 默认 examples/code/deps/multi_turn_feedback.yaml
 code_feedback_message_version: v0
 

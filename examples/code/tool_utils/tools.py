@@ -1155,6 +1155,14 @@ if __name__ == '__main__':
         code = code.strip()
         if not isinstance(code, str):
             code = str(code)
+
+        # Strip markdown code fences if present
+        # Handle ```python, ```py, or just ```
+        if code.startswith("```"):
+            code = code.lstrip("```").lstrip("python").lstrip("py").strip()
+            if code.endswith("```"):
+                code = code[:-3].strip()
+        
         actual_output, code_status, meta_data = await self.execution_pool.execute.remote(self.execute_code,code, memory_limit_mb, timeout, language, ground_truth, local_run)
         return actual_output, code_status, meta_data
 
@@ -1163,7 +1171,7 @@ CODE_INTERPRETER_SPEC = {
     "type": "function",
     "function": {
         "name": "code_interpreter",
-        "description": "A tool for executing Python code in a safe sandbox environment. Returns the standard output of the executed code.",
+        "description": "Executes Python code and returns the standard output. You MUST print the final result to stdout to get a response.",
         "parameters": {
             "type": "object",
             "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
@@ -1195,6 +1203,37 @@ class ToolRegistry:
     def get_tool_specs(self) -> list[dict[str, Any]]:
         """Get all tool specifications as a list."""
         return list(self.tools.values())
+
+    def to_openai_tools(self) -> list[dict[str, Any]]:
+        """
+        Convert registered tools to OpenAI-compatible tool definitions.
+        
+        Returns:
+            List of tool definitions in the format:
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "...",
+                        "description": "...",
+                        "parameters": {...}
+                    }
+                },
+                ...
+            ]
+        """
+        openai_tools = []
+        for tool_name, tool_data in self.tools.items():
+            # If the tool spec is already in OpenAI format (has "type": "function"), use it directly
+            if tool_data.get("type") == "function" and "function" in tool_data:
+                openai_tools.append(tool_data)
+            else:
+                # Otherwise wrap it
+                openai_tools.append({
+                    "type": "function",
+                    "function": tool_data
+                })
+        return openai_tools
 
     async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool call with the given arguments."""
@@ -1231,7 +1270,9 @@ class ToolRegistry:
             local_run=False
         )
         if isinstance(result, tuple) and len(result) >= 1:
-            return str(result[0])
+            result = str(result[0])
+        if result.strip() == "":
+            return "Execution finished with no output."
         return str(result)
 
 
