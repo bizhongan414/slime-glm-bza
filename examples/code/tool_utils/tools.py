@@ -37,7 +37,7 @@ import ray
 DEFAULT_TIMEOUT = 10  # Default compile and run timeout
 MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 1
-API_TIMEOUT = 10
+API_TIMEOUT = 20
 
 PY_IMPORTS = yaml.safe_load(open("examples/code/deps/header.yaml"))['python']
 logger = logging.getLogger(__name__)
@@ -568,10 +568,18 @@ class PythonSandbox:
 
                 # Check for Gateway Timeout (504) specifically for retrying
                 if response.status_code == 504:
-                    last_error = (
-                        f"{log_prefix}API Request Error: Gateway Timeout (504) on attempt "
-                        f"{attempt + 1}/{MAX_RETRIES}"
-                    )  # <-- Use internal log_prefix
+                    try:
+                        error_json = response.json()
+                        detail = error_json.get("run_result", {}).get("stderr", "Gateway Timeout")
+                        last_error = (
+                            f"{log_prefix}API Request Error: 504 Gateway Timeout - {detail} "
+                            f"(Attempt {attempt + 1}/{MAX_RETRIES})"
+                        )
+                    except Exception:
+                        last_error = (
+                            f"{log_prefix}API Request Error: Gateway Timeout (504) on attempt "
+                            f"{attempt + 1}/{MAX_RETRIES}"
+                        )
                     logger.warning(last_error)
                     if attempt < MAX_RETRIES - 1:  # Don't sleep after the last attempt
                         # Calculate increasing delay (e.g., 1s, 2s, 4s, ...) or (1s, 2s, 3s, ...)
@@ -581,6 +589,15 @@ class PythonSandbox:
                         logger.info(f"{log_prefix}Retrying after {delay} seconds...")  # <-- Use internal log_prefix
                         time.sleep(delay)
                     continue  # Go to the next retry attempt
+                
+
+                if response.status_code == 500:
+                    try:
+                        error_body = response.json()
+                        # 返回 body 让调用方按 SandboxError 正常处理
+                        return error_body, None
+                    except Exception:
+                        pass
 
                 # Check for other HTTP errors (e.g., 4xx, other 5xx)
                 response.raise_for_status()
@@ -603,7 +620,8 @@ class PythonSandbox:
                 break  # Exit retry loop on other unexpected errors
 
         # If loop finishes without returning success, return the last recorded error
-        logger.error(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")  # <-- Use internal log_prefix
+        logger.debug(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")
+        #logger.error(f"{log_prefix}Sandbox API call failed. Last error: {last_error}")  # <-- Use internal log_prefix
         # Return the error message without the prefix, as the caller doesn't need the internal ID
         # Ensure API call failure returns error message, leading to -1 in check_correctness
         return None, last_error.replace(log_prefix, "API Call Failed: ") if last_error else "API Call Failed after retries"
@@ -806,13 +824,17 @@ if __name__ == '__main__':
         }
         result_status = -1  # Default error: API request error or unknown sandbox error
         if error_msg:
+            # metadata["status"] = "api_error"
+            # result_status = -1  # API request itself failed (includes timeout after retries)
+            # logger.error(f"Case {case_index}: API error occurred: {error_msg}")
+            # # Log code and input only on error for brevity
+            # generation_to_log = generation[:200] + "..." if len(generation) > 200 else generation
+            # logger.error(f"Case {case_index}: code: {generation_to_log}")
+            # logger.error(f"Case {case_index}: input: {stdin}")
             metadata["status"] = "api_error"
-            result_status = -1  # API request itself failed (includes timeout after retries)
-            logger.error(f"Case {case_index}: API error occurred: {error_msg}")
-            # Log code and input only on error for brevity
-            generation_to_log = generation[:200] + "..." if len(generation) > 200 else generation
-            logger.error(f"Case {case_index}: code: {generation_to_log}")
-            logger.error(f"Case {case_index}: input: {stdin}")
+            metadata["api_status"] = "ApiError"
+            result_status = -1
+            logger.error(f"Case {case_index}: {error_msg}")
         elif api_response:
             # --- Add debug logging ---
             logger.debug(f"Case {case_index}: API Response: {api_response}")
@@ -839,6 +861,9 @@ if __name__ == '__main__':
             api_status = metadata["api_status"]
 
             if api_status == "SandboxError":
+                sandbox_err_detail = run_result.get("status", "unknown") if run_result else "no_run_result"
+                sandbox_err_msg = run_result.get("stderr", "") if run_result else ""
+                logger.error(f"Case {case_index}: SandboxError [{sandbox_err_detail}]: {sandbox_err_msg}")
                 metadata["status"] = "sandbox_error"
                 result_status = -1  # Internal sandbox error
             elif api_status == "Failed":
@@ -970,7 +995,7 @@ if __name__ == '__main__':
         first_test_error = -1
         
         #local run -- cpu_bound    Remote run -- io_bound get_k8s_cpu_limit()
-        max_workers = min(get_k8s_cpu_limit() // 2 , len(inputs)) if local_run else max(32, os.cpu_count() * 5)
+        max_workers = min(get_k8s_cpu_limit() // 2 , len(inputs)) if local_run else max(32, os.cpu_count() * 2)
         logger.info(f"Using max_workers={max_workers} for correctness check.")
         # max_workers is limited by sandbox_fusion_max_concurrent from concurrent_semaphore
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

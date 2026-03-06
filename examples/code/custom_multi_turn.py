@@ -640,11 +640,7 @@ class AgentLoop:
             new_tokens = [item[1] for item in meta_info["output_token_logprobs"]]
             new_logprobs = [item[0] for item in meta_info["output_token_logprobs"]]
         else:
-            # Fallback if no logprobs returned
-            new_tokens = await self.loop.run_in_executor(
-                None, lambda: self.state_manager.tokenizer.encode(response_text, add_special_tokens=False)
-            )
-            new_logprobs = [0.0] * len(new_tokens)
+            new_tokens, new_logprobs = [], []
         
         # Update AgentData with new response tokens (mask=1 for LLM generated)
         agent_data.prompt_ids += new_tokens
@@ -817,11 +813,12 @@ class AgentLoop:
                 agent_data.prompt_ids = agent_data.prompt_ids[:initial_prompt_len + self.max_response_length]
                 
         # Set tokens and masks using AgentData helper methods
-        sample.tokens = agent_data.get_full_token_sequence()
+        sample.tokens = agent_data.prompt_ids
         sample.loss_mask = agent_data.get_response_loss_mask()  # loss mask in slime is only for response part
         sample.rollout_log_probs = agent_data.get_response_log_probs()
         sample.response_length = agent_data.total_response_length
         
+        breakpoint()
         # Update conversation history
         #sample.prompt = agent_data.messages
         

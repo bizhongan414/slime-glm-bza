@@ -1,4 +1,94 @@
 #!/bin/bash
+pkill -9 sglang
+sleep 3
+ray stop --force
+pkill -9 ray
+pkill -9 python
+sleep 3
+pkill -9 ray
+pkill -9 python
+
+set -ex
+
+# apt-get install gawk -y
+# cp -r /gfs/space/chatrl/users/wlw_temp/wlw/firejail ~
+# cd ~/firejail
+# while true; do
+#    make clean
+#    ./configure
+#    make
+#    make install-strip
+#    firejail --version
+#    ret=$?
+#    if [ $ret -ne 0 ]; then
+#        echo 'install firejail failed: $ret'
+#    else
+#        break
+#    fi
+# done
+
+export REPO_PATH=/gfs/space/chatrl/users/wlw_temp/slime_code/slime/
+cd ${REPO_PATH}
+
+export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export nnodes=1
+export num_gpus_per_node=8
+ray start --head \
+  --node-ip-address ${MASTER_ADDR} \
+  --num-gpus ${num_gpus_per_node} \
+  --disable-usage-stats \
+  --dashboard-host=0.0.0.0 \
+  --dashboard-port=8265
+
+export RUNTIME_ENV_JSON="{
+  \"env_vars\": {
+    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+  }
+}"
+# will prevent ray from buffering stdout/stderr
+export PYTHONBUFFERED=16
+# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+NVLINK_COUNT=$(nvidia-smi | grep -o "NVLink" | wc -l)
+if [ "$NVLINK_COUNT" -gt 0 ]; then
+    HAS_NVLINK=1
+else
+    HAS_NVLINK=0
+fi
+echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
+
+export TIMESTAMP=$(date +"%y%m%d%H%M%S")
+
+
+export max_resp_len=$(( 1024 * 16 ))
+export max_context_len=$(( 1024 * 16 ))
+export rollout_batch_size=16
+export rollout_n=8
+export global_batch_size=128
+export num_steps_per_rollout=1
+export NCCL_GRAPH_REGISTER=0
+
+# export SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK=True
+# export SGLANG_LOGITS_PROCESSER_CHUNK_SIZE=1024
+
+export EXP_NAME=for_sandbox_debug
+export project_name=slime_30B-A3B_code_debug_single
+export EXP_DIR=/gfs/space/chatrl/users/wlw_temp/slime_code
+export DUMP_DIR=${EXP_DIR}/dump_details
+export LOG_FILE=${EXP_DIR}/logs/output_withtool_${TIMESTAMP}.log
+export CKPT_SAVE_PATH=${EXP_DIR}/checkpoints
+export TENSORBOARD_DIR=${EXP_DIR}/tensorboard_log/qwen3-8B_tool_${TIMESTAMP}
+
+# export MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
+# export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B-dist
+
+# export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4B
+# export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4Btorch_dist
+
+export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B
+export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B-dist
+
 set -ex
 pwd
 
@@ -17,10 +107,10 @@ ROLLOUT_ARGS=(
    --rollout-function-path examples.code.custom_multi_turn.generate_rollout
    #--prompt-data /gfs/space/chatrl/users/wlw_temp/verl/verl/experimental/agent_loop/tool_call_test_cases.jsonl
    #--prompt-data /gfs/space/chatrl/users/wlw_temp/data/dapo_17k/data/dapo-math-17k-with-answer-label.jsonl
-   #--prompt-data /gfs/space/chatrl/users/wlw_temp/wlw/data/slime/DeepCoder-Preview-Dataset_wlw/taco/train.jsonl
-   --prompt-data /gfs/space/chatrl/users/hxh/data/math_data/dapo-math/prompts/dapo-math-17k_dedup_no_prompt.jsonl
-   --input-key messages
-   --label-key answer
+   --prompt-data /gfs/space/chatrl/users/wlw_temp/wlw/data/slime/DeepCoder-Preview-Dataset_wlw/taco/train.jsonl
+   #--prompt-data /gfs/space/chatrl/users/hxh/data/math_data/dapo-math/prompts/dapo-math-17k_dedup_no_prompt.jsonl
+   --input-key prompt
+   #--label-key answer
 
    #I think we should return raw prompt in agentic rollout, 
    #all prompt initialization and formatting should be handled in agentic rollout?
@@ -57,7 +147,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 2
+   --tensor-model-parallel-size 4
    # --pipeline-model-parallel-size 2
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -71,6 +161,10 @@ PERF_ARGS=(
    --use-dynamic-batch-size
    --max-tokens-per-gpu ${max_context_len}
 )
+
+# TRAIN_BACKEND_ARGS=(
+#    --train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
+# )
 
 GRPO_ARGS=(
    --advantage-estimator grpo
@@ -97,7 +191,7 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
-   --sglang-mem-fraction-static 0.8
+   --sglang-mem-fraction-static 0.7
 
    # --sglang-max-running-requests 512
 )
@@ -119,9 +213,9 @@ CUSTOM_ARGS=(
 )
 
 REMOTE_RM_ARGS=(
-   --rm-api-key EMPTY
-   --rm-base-url http://10.102.236.235:6669/v1
-   --rm-model-name Qwen3-30B-A3B
+   # --rm-api-key EMPTY
+   # --rm-base-url http://10.108.193.214:6669/v1
+   # --rm-model-name Qwen3-30B-A3B
 )
 
 ray job submit --address="http://127.0.0.1:8265" \
@@ -150,7 +244,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --tensorboard-dir ${TENSORBOARD_DIR} \
    --actor-num-nodes ${nnodes} \
    --num-gpus-per-node ${num_gpus_per_node} \
-   --actor-num-gpus-per-node 4 \
+   --actor-num-gpus-per-node 8 \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

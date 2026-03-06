@@ -1,22 +1,16 @@
 tool_names: [code_interpreter] #[code_interpreter]
-interaction_name: null
+interaction_name: code
 tool_parser_name: qwen3
 chat_formatter_class: null
 tool_injection_method: native
 # for sandbox
-sandbox_local_run: true
-sandbox_default_time_limit_s: 15
+sandbox_default_time_limit_s: 30
 sandbox_default_memory_limit_mb: 1024
-sandbox_use_case_custom_time_limit: true
-sandbox_use_case_custom_memory_limit: true
-
-sandbox_url: http://222.223.106.147:20088/run_code_with_log
-
-execution_num_workers: 128
-use_local_sandbox: false
+sandbox_url: http://10.96.180.30:8080/model_code
+execution_num_workers: 64
 
 # for rollout
-rollout_max_turn: 6
+rollout_max_turn: 4
 code_feedback_message_filepath: examples/code/deps/multi_turn_feedback.yaml # 默认 examples/code/deps/multi_turn_feedback.yaml
 code_feedback_message_version: v0
 

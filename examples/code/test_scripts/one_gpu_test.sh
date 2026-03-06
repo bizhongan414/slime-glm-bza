@@ -31,7 +31,7 @@ cd ${REPO_PATH}
 
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export nnodes=1
-export num_gpus_per_node=4
+export num_gpus_per_node=1
 ray start --head \
   --node-ip-address ${MASTER_ADDR} \
   --num-gpus ${num_gpus_per_node} \
@@ -60,11 +60,11 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 export TIMESTAMP=$(date +"%y%m%d%H%M%S")
 
 
-export max_resp_len=$(( 1024 * 16 ))
-export max_context_len=$(( 1024 * 16 ))
-export rollout_batch_size=32
-export rollout_n=10
-export global_batch_size=320
+export max_resp_len=$(( 1024 * 8 ))
+export max_context_len=$(( 1024 * 8 ))
+export rollout_batch_size=1
+export rollout_n=1
+export global_batch_size=1
 export num_steps_per_rollout=1
 export NCCL_GRAPH_REGISTER=0
 
@@ -75,24 +75,24 @@ export EXP_NAME=for_sandbox_debug
 export project_name=slime_30B-A3B_code_debug_single
 export EXP_DIR=/gfs/space/chatrl/users/wlw_temp/slime_code
 export DUMP_DIR=${EXP_DIR}/dump_details_${TIMESTAMP}
-export LOG_FILE=${EXP_DIR}/logs/output_without_${TIMESTAMP}.log
+export LOG_FILE=${EXP_DIR}/logs/onegpu_test_${TIMESTAMP}.log
 export CKPT_SAVE_PATH=${EXP_DIR}/checkpoints_${TIMESTAMP}
-export TENSORBOARD_DIR=${EXP_DIR}/tensorboard_log/qwen3-8B_withouttool_${TIMESTAMP}
+export TENSORBOARD_DIR=${EXP_DIR}/tensorboard_log/onegputest_${TIMESTAMP}
 
 # export MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B
 # export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/deepseek-ai/DeepSeek-R1-0528-Qwen3-8B-dist
 
-# export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4B
-# export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4Btorch_dist
+export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4B
+export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-4Btorch_dist
 
-export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B
-export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B-dist
+# export MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B
+# export DIST_MODEL_PATH=/gfs/space/chatrl/public/models/Qwen3-8B-dist
 
 #!/bin/bash
 set -ex
 pwd
 
-source "/gfs/space/chatrl/users/wlw_temp/slime_code/slime/scripts/models/qwen3-8B.sh"
+source "/gfs/space/chatrl/users/wlw_temp/slime_code/slime/scripts/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_PATH}
@@ -104,8 +104,8 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   #--rollout-function-path examples.code.custom_multi_turn.generate_rollout
-   #--prompt-data /gfs/space/chatrl/users/wlw_temp/verl/verl/experimental/agent_loop/tool_call_test_cases.jsonl
+   --rollout-function-path examples.code.custom_multi_turn.generate_rollout
+   --prompt-data /gfs/space/chatrl/users/wlw_temp/verl/verl/experimental/agent_loop/tool_call_test_cases.jsonl
    #--prompt-data /gfs/space/chatrl/users/wlw_temp/data/dapo_17k/data/dapo-math-17k-with-answer-label.jsonl
    #--prompt-data /gfs/space/chatrl/users/wlw_temp/wlw/data/slime/DeepCoder-Preview-Dataset_wlw/taco/train.jsonl
    --prompt-data /gfs/space/chatrl/users/hxh/data/math_data/dapo-math/prompts/dapo-math-17k_dedup_no_prompt.jsonl
@@ -115,7 +115,7 @@ ROLLOUT_ARGS=(
    #I think we should return raw prompt in agentic rollout, 
    #all prompt initialization and formatting should be handled in agentic rollout?
    #--apply-chat-template
-   --apply-chat-template-kwargs '{"enable_thinking":true}'
+   --apply-chat-template-kwargs '{"enable_thinking":false}'
    #--rollout-shuffle
    --balance-data
    --rm-type dapo
@@ -127,7 +127,7 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len ${max_resp_len}
    --rollout-temperature 1
 
-   --save-debug-rollout-data /gfs/space/chatrl/users/wlw_temp/slime_code/logs/withouttool_Rollout_${TIMESTAMP}/exp1_rollout_{rollout_id}.pt
+   --save-debug-rollout-data /gfs/space/chatrl/users/wlw_temp/slime_code/logs/onegpu_test_${TIMESTAMP}/exp1_rollout_{rollout_id}.pt
 )
 
 EVAL_ARGS=(
@@ -143,11 +143,11 @@ EVAL_ARGS=(
    --eval-max-context-len ${max_context_len}
    --eval-temperature 1
    --eval-top-p 1
-   #--skip-eval-before-train
+   --skip-eval-before-train
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 1
    # --pipeline-model-parallel-size 2
    --context-parallel-size 1
    --expert-model-parallel-size 1
@@ -186,7 +186,7 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.7
 
    # --sglang-max-running-requests 512
@@ -232,7 +232,7 @@ ray job submit --address="http://127.0.0.1:8265" \
         "OMPI_MCA_plm_rsh_no_tree_spawn": "1",
         "OMPI_MCA_oob_tcp_if_include": "${MLP_SOCKET_IFNAME}",
         "OMPI_MCA_btl_tcp_if_include": "${MLP_SOCKET_IFNAME}",
-        "RAY_DEBUG": "0"
+        "RAY_DEBUG": "1"
      }
    }' \
    -- python3 train.py \
@@ -240,7 +240,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    --tensorboard-dir ${TENSORBOARD_DIR} \
    --actor-num-nodes ${nnodes} \
    --num-gpus-per-node ${num_gpus_per_node} \
-   --actor-num-gpus-per-node 4 \
+   --actor-num-gpus-per-node 1 \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \

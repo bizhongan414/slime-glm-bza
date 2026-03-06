@@ -1,7 +1,7 @@
 import json
 
 # 文件路径
-file_path = '/gfs/space/chatrl/users/wlw_temp/data/data_aime25/data/train-00000-of-00001_avg8.jsonl' #'/gfs/space/chatrl/users/lyy/data/code/livecodebench/sp_none_prompt_none/v6.jsonl'
+file_path = '/gfs/space/chatrl/users/wlw_temp/wlw/data/slime/DeepCoder-Preview-Dataset_wlw/taco/train.jsonl' #'/gfs/space/chatrl/users/lyy/data/code/livecodebench/sp_none_prompt_none/v6.jsonl'
 # /gfs/space/chatrl/users/hxh/data/math_data/dapo-math/prompts/dapo-math-17k_dedup_no_prompt.jsonl
 try:
     with open(file_path, 'r', encoding='utf-8') as f:
