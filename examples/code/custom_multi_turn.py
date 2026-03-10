@@ -802,13 +802,13 @@ class AgentLoop:
                 f"Truncating response from {agent_data.total_response_length} "
                 f"to {self.max_response_length} tokens"
             )
+            initial_prompt_len = len(agent_data.prompt_ids) - agent_data.total_response_length
             agent_data.response_ids = agent_data.response_ids[:self.max_response_length]
             agent_data.response_mask = agent_data.response_mask[:self.max_response_length]
             agent_data.response_logprobs = agent_data.response_logprobs[:self.max_response_length]
             # Also update prompt_ids to remove truncated response tokens
             # prompt_ids = initial_prompt + all_response_tokens, so we need to keep only
             # the initial prompt part + truncated response
-            initial_prompt_len = len(agent_data.prompt_ids) - agent_data.total_response_length
             if initial_prompt_len > 0:
                 agent_data.prompt_ids = agent_data.prompt_ids[:initial_prompt_len + self.max_response_length]
                 
