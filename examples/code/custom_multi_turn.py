@@ -464,7 +464,6 @@ class AgentLoop:
                     add_generation_prompt=add_generation_prompt
                 )
             )
-            breakpoint()
         else:
 
             prompt_ids = await self.loop.run_in_executor(
@@ -477,12 +476,21 @@ class AgentLoop:
                     **self.apply_chat_template_kwargs  # User-configurable extra args
                 )
             )
-            breakpoint()
         
         if remove_system_prompt and self.system_prompt_tokens:
             prompt_ids = prompt_ids[len(self.system_prompt_tokens):]
-        
-        return prompt_ids
+
+        # Newer tokenizer/chat-template codepaths may return BatchEncoding instead of
+        # a plain list[int]. Normalize here so downstream rollout/training code always
+        # receives raw token ids.
+        if hasattr(prompt_ids, "input_ids"):
+            prompt_ids = prompt_ids["input_ids"]
+        if prompt_ids and isinstance(prompt_ids[0], list):
+            prompt_ids = prompt_ids[0]
+        elif prompt_ids and hasattr(prompt_ids[0], "ids"):
+            prompt_ids = prompt_ids[0].ids
+
+        return list(prompt_ids)
 
     async def _call_tool(
         self, 
