@@ -1,5 +1,6 @@
 import dataclasses
 import itertools
+import json
 import logging
 import multiprocessing
 import os
@@ -33,6 +34,24 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _to_jsonable(obj):
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_to_jsonable(v) for v in obj]
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().tolist()
+    if dataclasses.is_dataclass(obj):
+        return _to_jsonable(dataclasses.asdict(obj))
+    return obj
 
 
 @dataclasses.dataclass
@@ -632,7 +651,12 @@ class RolloutManager:
                     samples=[sample.to_dict() for sample in data],
                 )
 
-            torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+            payload = dict(rollout_id=rollout_id, **dump_data)
+            if path.suffix.lower() == ".json":
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(_to_jsonable(payload), f, ensure_ascii=False, indent=2)
+            else:
+                torch.save(payload, path)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:
@@ -1185,6 +1209,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_custom_reward_and_sandbox_metrics(samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
@@ -1238,6 +1263,58 @@ def _compute_zero_std_metrics(args, all_samples: list[Sample]):
     interesting_rewards = [str(round(g[0].get_reward_value(args), 1)) for g in interesting_sample_groups]
 
     return {f"zero_std/count_{reward}": len(items) for reward, items in group_by(interesting_rewards).items()}
+
+
+def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
+    metrics = {}
+
+    def _safe_mean(values):
+        return float(np.mean(values).item()) if values else 0.0
+
+    format_scores = []
+    accurate_scores = []
+    sandbox_success = []
+    sandbox_runtime_error = []
+    tool_calls = []
+    tool_turns = []
+    code_usage_flags = []
+
+    for sample in all_samples:
+        reward = sample.reward if isinstance(sample.reward, dict) else {}
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        train_metadata = sample.train_metadata if isinstance(sample.train_metadata, dict) else {}
+
+        if "format_score" in reward:
+            format_scores.append(float(reward["format_score"]))
+        if "accurate_score" in reward:
+            accurate_scores.append(float(reward["accurate_score"]))
+        if "sandbox_success" in metadata:
+            sandbox_success.append(float(metadata["sandbox_success"]))
+        if "sandbox_runtime_error" in metadata:
+            sandbox_runtime_error.append(float(metadata["sandbox_runtime_error"]))
+        if "sandbox_tool_calls" in metadata:
+            tool_call_count = float(metadata["sandbox_tool_calls"])
+            tool_calls.append(tool_call_count)
+            code_usage_flags.append(1.0 if tool_call_count > 0 else 0.0)
+        if "_user_turns" in train_metadata:
+            tool_turns.append(float(train_metadata["_user_turns"]))
+
+    if format_scores:
+        metrics["format_score"] = _safe_mean(format_scores)
+    if accurate_scores:
+        metrics["accurate_score"] = _safe_mean(accurate_scores)
+    if sandbox_success:
+        metrics["sandbox_success"] = _safe_mean(sandbox_success)
+    if sandbox_runtime_error:
+        metrics["sandbox_runtime_error"] = _safe_mean(sandbox_runtime_error)
+    if tool_calls:
+        metrics["tool_calls"] = _safe_mean(tool_calls)
+    if tool_turns:
+        metrics["tool_turns"] = _safe_mean(tool_turns)
+    if code_usage_flags:
+        metrics["code_usage_rate"] = _safe_mean(code_usage_flags)
+
+    return metrics
 
 
 def _compute_spec_metrics(args, all_samples: list[Sample]):

@@ -1,0 +1,24 @@
+tool_names: [code_interpreter]
+interaction_name: null
+tool_parser_name: zhipu_xml
+chat_formatter_class: null
+tool_injection_method: native
+
+code_system_prompt: "You are a helpful assistant that can use the available tool to execute Python code. When computation or code execution is needed, call the `code_interpreter` tool using the model's required tool-calling format. Prefer code that prints the final result explicitly. Please reason step by step, and put your final answer within \\boxed{}."
+
+
+sandbox_default_time_limit_s: 30
+sandbox_default_memory_limit_mb: 1024
+sandbox_url: http://10.96.180.30:8080/model_code
+execution_num_workers: 32
+
+rollout_max_turn: 4
+eval_rollout_max_turn: 8
+code_feedback_message_filepath: examples/code/deps/multi_turn_feedback.yaml
+code_feedback_message_version: v0
+
+code_use_format_reward: False
+code_use_timeout_reward: False
+
+reward_key: score
+eval_reward_key: accurate_score
