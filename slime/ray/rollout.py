@@ -1278,6 +1278,8 @@ def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
     tool_calls = []
     tool_turns = []
     code_usage_flags = []
+    code_lines = []
+    code_elapsed_total = []
 
     for sample in all_samples:
         reward = sample.reward if isinstance(sample.reward, dict) else {}
@@ -1292,12 +1294,14 @@ def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
             sandbox_success.append(float(metadata["sandbox_success"]))
         if "sandbox_runtime_error" in metadata:
             sandbox_runtime_error.append(float(metadata["sandbox_runtime_error"]))
-        if "sandbox_tool_calls" in metadata:
-            tool_call_count = float(metadata["sandbox_tool_calls"])
-            tool_calls.append(tool_call_count)
-            code_usage_flags.append(1.0 if tool_call_count > 0 else 0.0)
-        if "_user_turns" in train_metadata:
-            tool_turns.append(float(train_metadata["_user_turns"]))
+        tool_call_count = float(metadata.get("sandbox_tool_calls", 0.0) or 0.0)
+        code_line_count = float(metadata.get("sandbox_code_lines", 0.0) or 0.0)
+        code_elapsed_count = float(metadata.get("sandbox_tool_elapsed_s_total", 0.0) or 0.0)
+        code_usage_flags.append(1.0 if tool_call_count > 0 else 0.0)
+        code_lines.append(code_line_count)
+        code_elapsed_total.append(code_elapsed_count)
+        tool_calls.append(tool_call_count)
+        tool_turns.append(float(train_metadata.get("_user_turns", 0.0) or 0.0))
 
     if format_scores:
         metrics["format_score"] = _safe_mean(format_scores)
@@ -1309,10 +1313,26 @@ def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
         metrics["sandbox_runtime_error"] = _safe_mean(sandbox_runtime_error)
     if tool_calls:
         metrics["tool_calls"] = _safe_mean(tool_calls)
+        metrics["avg_tool_call_nums"] = _safe_mean(tool_calls)
     if tool_turns:
         metrics["tool_turns"] = _safe_mean(tool_turns)
     if code_usage_flags:
         metrics["code_usage_rate"] = _safe_mean(code_usage_flags)
+        metrics["code_ratio"] = _safe_mean(code_usage_flags)
+        metrics["tool_call_response_rate"] = _safe_mean(code_usage_flags)
+    if code_lines:
+        metrics["code_lines_per_sample"] = _safe_mean(code_lines)
+    if code_elapsed_total:
+        metrics["code_elapsed_s_per_sample"] = _safe_mean(code_elapsed_total)
+    total_tool_calls = float(sum(tool_calls))
+    total_sandbox_success = float(sum(sandbox_success))
+    total_code_lines = float(sum(code_lines))
+    total_code_elapsed = float(sum(code_elapsed_total))
+    if total_tool_calls > 0:
+        metrics["code_lines_per_call"] = total_code_lines / total_tool_calls
+        metrics["code_pass_rate"] = total_sandbox_success / total_tool_calls
+        metrics["tool_call_exe_correct"] = total_sandbox_success / total_tool_calls
+        metrics["code_elapsed_s_per_call"] = total_code_elapsed / total_tool_calls
 
     return metrics
 
