@@ -1271,12 +1271,17 @@ def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
     def _safe_mean(values):
         return float(np.mean(values).item()) if values else 0.0
 
+    # 按样本聚合的评估/rollout 指标。
+    # 这些指标会写入 TensorBoard，用来观察：
+    # 1. 数学答案是否正确；
+    # 2. 工具是否被使用；
+    # 3. 工具是否成功执行；
+    # 4. 代码长度和耗时分布。
     format_scores = []
     accurate_scores = []
     sandbox_success = []
     sandbox_runtime_error = []
     tool_calls = []
-    tool_turns = []
     code_usage_flags = []
     code_lines = []
     code_elapsed_total = []
@@ -1284,7 +1289,6 @@ def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
     for sample in all_samples:
         reward = sample.reward if isinstance(sample.reward, dict) else {}
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        train_metadata = sample.train_metadata if isinstance(sample.train_metadata, dict) else {}
 
         if "format_score" in reward:
             format_scores.append(float(reward["format_score"]))
@@ -1301,37 +1305,42 @@ def _compute_custom_reward_and_sandbox_metrics(all_samples: list[Sample]):
         code_lines.append(code_line_count)
         code_elapsed_total.append(code_elapsed_count)
         tool_calls.append(tool_call_count)
-        tool_turns.append(float(train_metadata.get("_user_turns", 0.0) or 0.0))
 
     if format_scores:
+        # 格式分。当前奖励函数里通常是：
+        # 有合法 boxed 答案记 1，格式错记 -1。
         metrics["format_score"] = _safe_mean(format_scores)
     if accurate_scores:
+        # 准确率分。表示最终答案是否正确，通常取值在 [0, 1]。
         metrics["accurate_score"] = _safe_mean(accurate_scores)
     if sandbox_success:
+        # 每个样本内成功执行的 tool call 次数，再对样本做平均。
         metrics["sandbox_success"] = _safe_mean(sandbox_success)
     if sandbox_runtime_error:
+        # 每个样本内 runtime error 次数，再对样本做平均。
         metrics["sandbox_runtime_error"] = _safe_mean(sandbox_runtime_error)
     if tool_calls:
+        # 平均每个样本调用了多少次工具。
         metrics["tool_calls"] = _safe_mean(tool_calls)
-        metrics["avg_tool_call_nums"] = _safe_mean(tool_calls)
-    if tool_turns:
-        metrics["tool_turns"] = _safe_mean(tool_turns)
     if code_usage_flags:
+        # 有过至少一次 tool call 的样本占比。
         metrics["code_usage_rate"] = _safe_mean(code_usage_flags)
-        metrics["code_ratio"] = _safe_mean(code_usage_flags)
-        metrics["tool_call_response_rate"] = _safe_mean(code_usage_flags)
     if code_lines:
+        # 平均每个样本累计执行了多少行代码。
         metrics["code_lines_per_sample"] = _safe_mean(code_lines)
     if code_elapsed_total:
+        # 平均每个样本累计花了多少秒在工具执行上。
         metrics["code_elapsed_s_per_sample"] = _safe_mean(code_elapsed_total)
     total_tool_calls = float(sum(tool_calls))
     total_sandbox_success = float(sum(sandbox_success))
     total_code_lines = float(sum(code_lines))
     total_code_elapsed = float(sum(code_elapsed_total))
     if total_tool_calls > 0:
+        # 平均每次 tool call 的代码行数。
         metrics["code_lines_per_call"] = total_code_lines / total_tool_calls
+        # tool 执行成功率：成功执行次数 / 总 tool call 次数。
         metrics["code_pass_rate"] = total_sandbox_success / total_tool_calls
-        metrics["tool_call_exe_correct"] = total_sandbox_success / total_tool_calls
+        # 平均每次 tool call 的执行耗时（秒）。
         metrics["code_elapsed_s_per_call"] = total_code_elapsed / total_tool_calls
 
     return metrics

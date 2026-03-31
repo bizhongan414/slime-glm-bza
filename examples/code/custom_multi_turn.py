@@ -907,7 +907,17 @@ class AgentLoop:
         # Update conversation history
         #sample.prompt = agent_data.messages
         
-        # Set training metadata
+        # 这里把多轮交互过程中累计出来的统计信息挂到 sample 上。
+        #
+        # 1. sample.reward：
+        #    由 reward 函数写入，通常包含 score / format_score / accurate_score。
+        # 2. sample.metadata：
+        #    由工具执行链路写入，通常包含 sandbox_success / sandbox_runtime_error /
+        #    sandbox_tool_calls / sandbox_code_lines / sandbox_tool_elapsed_s_total 等。
+        # 3. sample.train_metadata：
+        #    记录训练/rollout 过程统计，如轮次数、有效 response 长度、是否被截断。
+        #
+        # rollout.py 里的 TensorBoard 指标就是从这三部分再做聚合得到的。
         sample.train_metadata = {
             "_turn_idx": agent_data.turn_idx,
             "_user_turns": agent_data.user_turns,
